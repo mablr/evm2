@@ -54,8 +54,60 @@ pub struct State<'a> {
     storage_pool: storage_pool::StoragePool,
     /// Transaction-scoped EIP-1153 transient storage keyed by account address and slot.
     transient_storage: StorageKeyMap<Word>,
+    /// Active execution-frame rollback boundaries. Never copied on ordinary frame entry.
+    frames: Vec<FrameBoundary>,
+    next_frame_id: u64,
+    snapshot_owner: Arc<()>,
+    snapshot_generation: u64,
+    checkpoint_generation: u64,
     /// Inner state.
     inner: StateInner<'a>,
+}
+
+/// Reusable snapshot of one state's current transaction layer.
+///
+/// Captures account and storage metadata, access warmth, transient storage, the
+/// journal, logs and active engine-frame rollback boundaries. Does not capture
+/// the accepted overlay, backing database, environments, gas or interpreter
+/// continuations. Those external state sources must remain compatible.
+///
+/// Snapshots cannot be restored after [`State::clear_transaction_state`].
+#[derive(Clone, Debug)]
+pub struct TransactionSnapshot {
+    accounts: AddressMap<Account>,
+    storage: AddressMap<StorageOverlay>,
+    transient_storage: StorageKeyMap<Word>,
+    prewarm_set: PrewarmSet,
+    journal: Vec<JournalEntry>,
+    logs: Vec<Log>,
+    selfdestructs: AddressSet,
+    frames: Vec<FrameBoundary>,
+    owner: Arc<()>,
+    generation: u64,
+}
+
+/// A token for a registered active execution frame.
+#[derive(Debug)]
+pub(crate) struct FrameCheckpoint(u64);
+
+#[derive(Clone, Debug)]
+struct FrameBoundary {
+    id: u64,
+    checkpoint: StateCheckpoint,
+}
+
+/// The snapshot belongs to another state instance or transaction lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("snapshot belongs to another state or transaction lifecycle")]
+pub struct SnapshotEpochMismatch;
+
+/// Log handling when restoring a transaction snapshot.
+#[derive(Clone, Copy, Debug)]
+pub enum SnapshotLogs {
+    /// Restore the captured log sequence.
+    Restore,
+    /// Retain the current log sequence; ordinary frame rollback still applies.
+    Retain,
 }
 
 impl<'a> Deref for State<'a> {
@@ -107,6 +159,11 @@ impl<'a> State<'a> {
             storage: AddressMap::default(),
             storage_pool: storage_pool::StoragePool::default(),
             transient_storage: StorageKeyMap::default(),
+            frames: Vec::new(),
+            next_frame_id: 0,
+            snapshot_owner: Arc::new(()),
+            snapshot_generation: 0,
+            checkpoint_generation: 0,
             inner: StateInner {
                 database: CacheDB::new(initial),
                 prewarm_set: PrewarmSet::new(),
@@ -117,10 +174,96 @@ impl<'a> State<'a> {
         }
     }
 
-    /// Returns a checkpoint for later rollback.
+    /// Copies the transaction layer at an explicit snapshot boundary.
+    pub fn transaction_snapshot(&self) -> TransactionSnapshot {
+        TransactionSnapshot {
+            accounts: self.accounts.clone(),
+            storage: self.storage.clone(),
+            transient_storage: self.transient_storage.clone(),
+            prewarm_set: self.prewarm_set.clone(),
+            journal: self.journal.clone(),
+            logs: self.logs.clone(),
+            selfdestructs: self.selfdestructs.clone(),
+            frames: self.frames.clone(),
+            owner: self.snapshot_owner.clone(),
+            generation: self.snapshot_generation,
+        }
+    }
+
+    /// Replaces transaction state without rewinding execution continuations.
+    ///
+    /// A captured frame retains its captured undo boundary. A frame entered after
+    /// capture starts a new undo scope at the restored boundary: reverting that
+    /// frame does not undo the restoration, only subsequent mutations. Captured
+    /// frames that have already returned are never resurrected.
+    ///
+    /// Only registered engine frame checkpoints participate. Raw `checkpoint()`
+    /// cursors must not be held across this operation. Snapshots from another state
+    /// instance or a cleared transaction are rejected before any mutation.
+    pub fn restore_transaction_snapshot(
+        &mut self,
+        snapshot: &TransactionSnapshot,
+        logs: SnapshotLogs,
+    ) -> Result<(), SnapshotEpochMismatch> {
+        if !Arc::ptr_eq(&snapshot.owner, &self.snapshot_owner)
+            || snapshot.generation != self.snapshot_generation
+        {
+            return Err(SnapshotEpochMismatch);
+        }
+        self.checkpoint_generation =
+            self.checkpoint_generation.checked_add(1).expect("checkpoint generation exhausted");
+        // Frames are stack ordered. Shared frame identities always form a prefix.
+        for (index, frame) in self.frames.iter_mut().enumerate() {
+            frame.checkpoint.generation = self.checkpoint_generation;
+            let captured = snapshot.frames.get(index).filter(|saved| saved.id == frame.id);
+            frame.checkpoint.journal_len =
+                captured.map_or(snapshot.journal.len(), |saved| saved.checkpoint.journal_len);
+            if matches!(logs, SnapshotLogs::Restore) {
+                frame.checkpoint.logs_len =
+                    captured.map_or(snapshot.logs.len(), |saved| saved.checkpoint.logs_len);
+            }
+        }
+        self.accounts.clone_from(&snapshot.accounts);
+        self.storage.clone_from(&snapshot.storage);
+        self.transient_storage.clone_from(&snapshot.transient_storage);
+        self.prewarm_set.clone_from(&snapshot.prewarm_set);
+        self.journal.clone_from(&snapshot.journal);
+        self.selfdestructs.clone_from(&snapshot.selfdestructs);
+        if matches!(logs, SnapshotLogs::Restore) {
+            self.logs.clone_from(&snapshot.logs);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enter_frame(&mut self) -> FrameCheckpoint {
+        let id = self.next_frame_id;
+        self.next_frame_id = id.checked_add(1).expect("frame ID exhausted");
+        self.frames.push(FrameBoundary { id, checkpoint: self.checkpoint() });
+        FrameCheckpoint(id)
+    }
+
+    pub(crate) fn commit_frame(&mut self, token: FrameCheckpoint) {
+        let frame = self.frames.pop().expect("missing active frame");
+        assert_eq!(frame.id, token.0, "frames must settle in stack order");
+    }
+
+    pub(crate) fn rollback_frame(&mut self, token: FrameCheckpoint, features: EvmFeatures) {
+        let frame = self.frames.pop().expect("missing active frame");
+        assert_eq!(frame.id, token.0, "frames must settle in stack order");
+        self.rollback(frame.checkpoint, features);
+    }
+
+    /// Returns a raw checkpoint for later rollback.
+    ///
+    /// Snapshot restoration and transaction clearing invalidate this checkpoint.
+    /// Engine-managed frame rollback boundaries are coordinated independently.
     #[inline]
     pub const fn checkpoint(&self) -> StateCheckpoint {
-        StateCheckpoint::new(self.inner.journal.len(), self.inner.logs.len())
+        StateCheckpoint::new(
+            self.inner.journal.len(),
+            self.inner.logs.len(),
+            self.checkpoint_generation,
+        )
     }
 
     /// Returns the initial database.
@@ -348,12 +491,18 @@ impl<'a> State<'a> {
 
     /// Clears transaction-scoped substate.
     pub fn clear_transaction_state(&mut self) {
+        assert!(self.frames.is_empty(), "cannot clear state while frames are suspended");
+        self.snapshot_generation =
+            self.snapshot_generation.checked_add(1).expect("snapshot generation exhausted");
+        self.checkpoint_generation =
+            self.checkpoint_generation.checked_add(1).expect("checkpoint generation exhausted");
         let Self {
             accounts,
             storage,
             storage_pool,
             transient_storage,
             inner: StateInner { prewarm_set, journal, selfdestructs, logs, database: _ },
+            ..
         } = self;
         accounts.clear();
         storage_pool.clear(storage);
@@ -637,8 +786,18 @@ impl<'a> State<'a> {
     }
 
     /// Reverts state changes after the checkpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the raw checkpoint predates transaction clearing or snapshot
+    /// restoration, or its cursors exceed the current journal/log lengths. Engine
+    /// frame settlement uses separately registered, replacement-aware boundaries.
     #[inline(never)]
     pub fn rollback(&mut self, checkpoint: StateCheckpoint, features: EvmFeatures) {
+        assert_eq!(
+            checkpoint.generation, self.checkpoint_generation,
+            "raw checkpoint invalidated by state replacement or transaction clearing"
+        );
         assert!(checkpoint.journal_len <= self.journal.len(), "checkpoint is past journal length");
         assert!(checkpoint.logs_len <= self.logs.len(), "checkpoint is past logs length");
         self.logs.truncate(checkpoint.logs_len);
@@ -876,3 +1035,6 @@ impl<'a> State<'a> {
         self.inner.selfdestructs.clear();
     }
 }
+
+#[cfg(test)]
+mod live_snapshot_tests;

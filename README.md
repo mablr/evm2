@@ -40,6 +40,8 @@ fn main() -> Result<()> {
 
 See [`crates/evm2/examples/custom_evm`](crates/evm2/examples/custom_evm) for the complete version.
 
+See [live transaction snapshots](docs/live-state-snapshots.md) for callback-time state restoration and its scope.
+
 ## Benchmarks
 
 ```sh

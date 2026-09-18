@@ -4,7 +4,13 @@ use super::AccountInfo;
 use crate::interpreter::Word;
 use alloy_primitives::Address;
 
-/// State checkpoint for reverting state changes.
+/// Raw journal/log checkpoint for reverting state changes.
+///
+/// Obtain checkpoints from [`State::checkpoint`](super::State::checkpoint).
+/// A transaction snapshot restoration invalidates raw checkpoints, even when
+/// their numeric cursors fit the new history. The engine coordinates its active
+/// frame boundaries separately; custom handlers must not retain raw checkpoints
+/// across restoration.
 #[allow(missing_copy_implementations)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateCheckpoint {
@@ -12,13 +18,15 @@ pub struct StateCheckpoint {
     pub(crate) journal_len: usize,
     /// Emitted log count at the checkpoint.
     pub(crate) logs_len: usize,
+    /// State-replacement generation that owns these cursors.
+    pub(crate) generation: u64,
 }
 
 impl StateCheckpoint {
     /// Creates a checkpoint from journal and log cursors.
     #[inline]
-    pub const fn new(journal_len: usize, logs_len: usize) -> Self {
-        Self { journal_len, logs_len }
+    pub(crate) const fn new(journal_len: usize, logs_len: usize, generation: u64) -> Self {
+        Self { journal_len, logs_len, generation }
     }
 
     /// Returns the revert-journal cursor captured by this checkpoint.

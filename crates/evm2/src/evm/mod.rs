@@ -173,11 +173,12 @@ mod tx;
 pub use tx::{ExecutedTx, TxResult, TxResultExt, TxResultWithState};
 
 mod state;
+use state::FrameCheckpoint;
 pub use state::{
     AccountChangeRef, AccountHandle, AccountInfo, BlockStateAccumulator, JournalEntry,
-    NoopChangeSink, PendingState, State, StateChangeSink, StateChangeSource, StateCheckpoint,
-    StateInner, StorageChange, StorageHandle, StorageOverlay, StorageSlot, StorageSlotHandle, Tee,
-    Tracked,
+    NoopChangeSink, PendingState, SnapshotEpochMismatch, SnapshotLogs, State, StateChangeSink,
+    StateChangeSource, StateCheckpoint, StateInner, StorageChange, StorageHandle, StorageOverlay,
+    StorageSlot, StorageSlotHandle, Tee, Tracked, TransactionSnapshot,
 };
 
 mod prewarm_set;
@@ -1216,9 +1217,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         if let Err(stop) = self.prepare_create_message(message) {
             return Self::error_message_result(stop, message.gas_limit, message.reservoir);
         }
-        let checkpoint = self.state.checkpoint();
+        let checkpoint = self.state.enter_frame();
         if let Err(stop) = self.create_message_account(message) {
-            self.state.rollback(checkpoint, self.features);
+            self.state.rollback_frame(checkpoint, self.features);
             return Self::error_message_result(stop, message.gas_limit, message.reservoir);
         }
         message.code_address = message.destination;
@@ -1278,7 +1279,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline(never)]
     fn finish_create_message_run(
         &mut self,
-        checkpoint: StateCheckpoint,
+        checkpoint: FrameCheckpoint,
         address: &Address,
         gas_limit: u64,
         stop: InstrStop,
@@ -1288,7 +1289,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let output = if stop.is_success() {
             let mut output = Bytes::copy_from_slice(interp.output());
             if let Err(stop) = self.validate_create_output(&mut gas, &mut output) {
-                self.state.rollback(checkpoint, self.features);
+                self.state.rollback_frame(checkpoint, self.features);
                 return MessageResultExt {
                     stop,
                     gas: *gas.tracker(),
@@ -1304,14 +1305,15 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 .account(address, false)
                 .map(|mut a| a.set_code_slow(Bytecode::new_legacy(output.clone())))
             {
-                self.state.rollback(checkpoint, self.features);
+                self.state.rollback_frame(checkpoint, self.features);
                 let stop = self.store_error(code);
                 return Self::error_message_result(stop, gas_limit, gas.reservoir());
             }
 
+            self.state.commit_frame(checkpoint);
             output
         } else {
-            self.state.rollback(checkpoint, self.features);
+            self.state.rollback_frame(checkpoint, self.features);
             Bytes::copy_from_slice(interp.output())
         };
 
@@ -1377,7 +1379,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 message.reservoir,
             );
         }
-        let checkpoint = self.state.checkpoint();
+        let checkpoint = self.state.enter_frame();
         // EIP-161 state clearing depends on zero-value direct call targets being touched.
         let transfers_balance = matches!(
             message.kind,
@@ -1387,11 +1389,13 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             || match self.state.transfer(&message.caller, &message.destination, &message.value) {
                 Ok(result) => result,
                 Err(code) => {
+                    self.state.commit_frame(checkpoint);
                     let stop = self.store_error(code);
                     return Self::error_message_result(stop, message.gas_limit, message.reservoir);
                 }
             };
         if transfers_balance && !transfer_succeeded {
+            self.state.commit_frame(checkpoint);
             return Self::error_message_result(
                 InstrStop::OutOfFunds,
                 message.gas_limit,
@@ -1414,7 +1418,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline(never)]
     fn execute_call_precompile(
         &mut self,
-        checkpoint: StateCheckpoint,
+        checkpoint: FrameCheckpoint,
         message: &Message<T>,
     ) -> MessageResult<T> {
         let mut gas =
@@ -1437,7 +1441,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             }
         };
         if !stop.is_success() {
-            self.state.rollback(checkpoint, self.features);
+            self.state.rollback_frame(checkpoint, self.features);
+        } else {
+            self.state.commit_frame(checkpoint);
         }
         MessageResultExt {
             stop,
@@ -1452,14 +1458,16 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline(never)]
     fn finish_call_message_run(
         &mut self,
-        checkpoint: StateCheckpoint,
+        checkpoint: FrameCheckpoint,
         stop: InstrStop,
     ) -> MessageResult<T> {
         let interp = self.interpreter_pool.last_mut().unwrap();
         let child_gas = interp.gas();
         let output = Bytes::copy_from_slice(interp.output());
         if !stop.is_success() {
-            self.state.rollback(checkpoint, self.features);
+            self.state.rollback_frame(checkpoint, self.features);
+        } else {
+            self.state.commit_frame(checkpoint);
         }
 
         MessageResultExt {
@@ -3789,3 +3797,6 @@ mod tests {
         assert!(state.account_info_untracked(&contract).unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+mod live_snapshot_tests;

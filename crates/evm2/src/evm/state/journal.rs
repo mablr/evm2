@@ -44,8 +44,15 @@ pub enum JournalEntry {
     AccountChange {
         /// Account address.
         address: Address,
-        /// Previous present account value.
+        /// Snapshot payload; balance/nonce encode relative undo when the corresponding flag is
+        /// set.
         previous: Option<AccountInfo>,
+        /// Whether balance changes in this handle were relative (including no change).
+        balance_is_delta: bool,
+        /// Whether nonce changes in this handle were increments (including no change).
+        nonce_is_delta: bool,
+        /// Whether this handle incremented the nonce once.
+        nonce_bumped: bool,
         /// Previous warm flag.
         previous_is_warm: bool,
         /// Previous touched flag.

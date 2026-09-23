@@ -614,18 +614,15 @@ impl<'a> State<'a> {
 
         {
             let mut from_account = self.account(from, false)?;
-            let Some(new_from_balance) = from_account.balance().checked_sub(*value) else {
+            if from_account.balance() < *value {
                 return Ok(false);
-            };
-            // `set_balance` touches the account, matching the touch the prior `transfer` performed.
-            from_account.set_balance(new_from_balance);
-            from_account.touch();
+            }
+            from_account.add_balance(Word::ZERO.wrapping_sub(*value));
         }
         {
             let mut to_account = self.account(to, false)?;
             let new_to_balance = to_account.balance().saturating_add(*value);
-            to_account.set_balance(new_to_balance);
-            to_account.touch();
+            to_account.add_balance(new_to_balance.wrapping_sub(to_account.balance()));
         }
         Ok(true)
     }
@@ -653,29 +650,18 @@ impl<'a> State<'a> {
         // caller untouched, matching the prior `transfer` behaviour.
         if !value.is_zero() {
             let mut caller_account = self.account(caller, false)?;
-            let Some(new_caller_balance) = caller_account.balance().checked_sub(*value) else {
+            if caller_account.balance() < *value {
                 return Ok(Err(InstrStop::OutOfFunds));
-            };
-            caller_account.set_balance(new_caller_balance);
+            }
+            caller_account.add_balance(Word::ZERO.wrapping_sub(*value));
         }
 
         let mut target = self.account(address, false)?;
-        // Preserve any balance the address already held (e.g. funds sent before creation) and add
-        // the endowment.
-        let balance = target.balance().wrapping_add(*value);
-        #[cfg(feature = "account-ext")]
-        let extension = target.get().map(|info| info.extension.clone()).unwrap_or_default();
-        *target.get_or_insert() = AccountInfo {
-            nonce: u64::from(features.contains(EvmFeatures::EIP161)),
-            balance,
-            code_hash: KECCAK256_EMPTY,
-            code: Some(Bytecode::default()),
-            _non_exhaustive: (),
-            #[cfg(feature = "account-ext")]
-            extension,
-        };
+        // Creation restores the previous nonce/code but reverses endowment as a transfer.
+        target.add_balance(*value);
+        target.set_nonce(u64::from(features.contains(EvmFeatures::EIP161)));
+        target.set_code_slow(Bytecode::default());
         target.mark_created();
-        target.touch();
         Ok(Ok(()))
     }
 
@@ -754,6 +740,9 @@ impl<'a> State<'a> {
                 JournalEntry::AccountChange {
                     address,
                     previous,
+                    balance_is_delta: _,
+                    nonce_is_delta: _,
+                    nonce_bumped: _,
                     previous_is_warm,
                     previous_is_touched,
                     previous_is_destroyed,

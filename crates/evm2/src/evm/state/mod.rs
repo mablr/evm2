@@ -798,6 +798,9 @@ impl<'a> State<'a> {
                         slot.value.current = previous;
                     }
                 }
+                JournalEntry::StorageWipe { address, previous } => {
+                    self.storage.insert(address, previous);
+                }
                 JournalEntry::TransientStorageChange { address, key, previous } => match previous {
                     Some(previous) if !previous.is_zero() => {
                         self.transient_storage.insert(StorageKey::new(address, key), previous);
@@ -1168,6 +1171,45 @@ mod tests {
             assert_eq!(state.tload(&Address::ZERO, &Word::ZERO), Word::ZERO);
             assert!(state.logs().is_empty());
         }
+    }
+
+    #[test]
+    fn journaled_storage_wipe_rolls_back_and_commits() {
+        let address = Address::with_last_byte(42);
+        let key = Word::from(1);
+        let other = Word::from(2);
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default());
+        db.insert_account_storage(&address, &key, &Word::from(7));
+        db.insert_account_storage(&address, &other, &Word::from(8));
+        let mut state = State::new(db);
+        let parent = state.checkpoint();
+        state.storage_slot(&address, key, false).unwrap().write(Word::from(9));
+        state.storage_slot(&address, key, false).unwrap().warm();
+        let child = state.checkpoint();
+
+        state.storage(&address).wipe_journaled();
+        assert!(state.storage(&address).is_wiped());
+        assert_eq!(state.storage_slot(&address, key, false).unwrap().current(), Word::ZERO);
+        assert_eq!(state.storage_slot(&address, other, false).unwrap().current(), Word::ZERO);
+        assert!(state.storage(&address).is_warm(&key));
+        state.storage_slot(&address, key, false).unwrap().write(Word::from(11));
+
+        state.rollback(child, EvmFeatures::empty());
+        assert!(!state.storage(&address).is_wiped());
+        assert_eq!(state.storage_slot(&address, key, false).unwrap().current(), Word::from(9));
+        assert_eq!(state.storage_slot(&address, other, false).unwrap().current(), Word::from(8));
+        assert!(state.storage(&address).is_warm(&key));
+
+        state.rollback(parent, EvmFeatures::empty());
+        assert_eq!(state.storage_slot(&address, key, false).unwrap().current(), Word::from(7));
+        assert!(!state.storage(&address).is_warm(&key));
+
+        state.storage(&address).wipe_journaled();
+        state.storage_slot(&address, other, false).unwrap().write(Word::from(12));
+        state.commit_transaction();
+        assert_eq!(state.storage_slot(&address, key, false).unwrap().current(), Word::ZERO);
+        assert_eq!(state.storage_slot(&address, other, false).unwrap().current(), Word::from(12));
     }
 
     #[test]

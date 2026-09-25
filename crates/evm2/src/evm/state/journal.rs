@@ -73,6 +73,13 @@ pub enum JournalEntry {
         /// Previous current storage value.
         previous: Word,
     },
+    /// Persistent storage was wiped within a revertible scope.
+    StorageWipe {
+        /// Account address.
+        address: Address,
+        /// Storage overlay before the wipe.
+        previous: super::StorageOverlay,
+    },
     /// Transient storage changed.
     TransientStorageChange {
         /// Account address.

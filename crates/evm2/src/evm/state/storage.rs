@@ -202,6 +202,18 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
             slot.value.set_current(Word::ZERO);
         });
     }
+
+    /// Wipes persistent storage within a revertible execution scope.
+    ///
+    /// Unlike [`Self::wipe`], the prior overlay is journaled so a later rollback restores loaded
+    /// values, writes, and slot warmth.
+    pub fn wipe_journaled(&mut self) {
+        self.inner.journal.push(JournalEntry::StorageWipe {
+            address: self.address,
+            previous: self.storage.clone(),
+        });
+        self.wipe();
+    }
 }
 
 /// A mutable, journaled handle to a single, loaded persistent storage slot.

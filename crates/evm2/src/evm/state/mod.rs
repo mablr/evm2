@@ -378,6 +378,26 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Cools runtime account and storage accesses without changing values or touch status.
+    ///
+    /// This visits loaded overlays, including slots imported from an isolated transaction that
+    /// have no entries in this state's journal. `exempt` can retain warmth for special accounts.
+    /// The pre-warmed set remains effective, and this adds no journal entries or database reads.
+    pub fn cool_loaded_accesses(&mut self, exempt: impl Fn(&Address) -> bool) {
+        for (address, account) in &mut self.accounts {
+            if !exempt(address) && !self.inner.prewarm_set.is_warm(address) {
+                account.is_warm = false;
+            }
+        }
+        for (address, storage) in &mut self.storage {
+            if !exempt(address) {
+                for slot in storage.slots.values_mut() {
+                    slot.is_warm = false;
+                }
+            }
+        }
+    }
+
     /// Reads a storage slot from the committed state (accepted overlay and backing database),
     /// ignoring the in-flight transaction overlay.
     #[inline]
@@ -1378,5 +1398,39 @@ mod tests {
             assert_eq!(slot.is_warm(), key == Word::ONE);
             assert_eq!((slot.original(), slot.current()), (Word::ZERO, Word::from(7)));
         }
+    }
+
+    #[test]
+    fn cools_accesses_imported_from_an_isolated_transaction() {
+        let address = Address::with_last_byte(42);
+        let exempt = Address::with_last_byte(43);
+        let prewarmed = Address::with_last_byte(44);
+        let mut parent = State::new(EmptyDB::default());
+        let mut child = State::new(EmptyDB::default());
+        parent.prewarm_storage_slot(&prewarmed, Word::ZERO);
+
+        for account_address in [address, exempt, prewarmed] {
+            {
+                let mut account = child.account(&account_address, false).unwrap();
+                account.set_balance(Word::from(7));
+                account.warm();
+            }
+            child.storage_slot(&account_address, Word::ZERO, false).unwrap().warm();
+        }
+        parent.merge_isolated_state(child.take_pending_state());
+        let checkpoint = parent.checkpoint();
+        assert!(parent.journal().is_empty());
+
+        parent.cool_loaded_accesses(|loaded| *loaded == exempt);
+
+        assert_eq!(parent.checkpoint(), checkpoint);
+        assert!(parent.account(&address, false).unwrap().is_touched());
+        assert_eq!(parent.account(&address, false).unwrap().balance(), Word::from(7));
+        assert!(parent.account(&address, false).unwrap().warm());
+        assert!(parent.storage_slot(&address, Word::ZERO, false).unwrap().warm());
+        assert!(parent.account(&prewarmed, false).unwrap().is_warm());
+        assert!(parent.storage_slot(&prewarmed, Word::ZERO, false).unwrap().is_warm());
+        assert!(!parent.account(&exempt, false).unwrap().warm());
+        assert!(!parent.storage_slot(&exempt, Word::ZERO, false).unwrap().warm());
     }
 }

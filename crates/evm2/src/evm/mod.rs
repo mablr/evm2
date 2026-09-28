@@ -174,11 +174,12 @@ pub use tx::{ExecutedTx, TxResult, TxResultExt, TxResultWithState};
 mod state;
 #[cfg(feature = "account-ext")]
 pub use state::AccountExtension;
+use state::FrameCheckpoint;
 pub use state::{
     AccountChangeRef, AccountHandle, AccountInfo, BlockStateAccumulator, JournalEntry,
-    NoopChangeSink, PendingState, State, StateChangeSink, StateChangeSource, StateCheckpoint,
-    StateInner, StateSnapshot, StorageChange, StorageHandle, StorageOverlay, StorageSlot,
-    StorageSlotHandle, Tee, Tracked,
+    NoopChangeSink, PendingState, SnapshotLogs, State, StateChangeSink, StateChangeSource,
+    StateCheckpoint, StateInner, StateSnapshot, StorageChange, StorageHandle, StorageOverlay,
+    StorageSlot, StorageSlotHandle, Tee, Tracked,
 };
 
 mod prewarm_set;
@@ -1178,9 +1179,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 HostError::Execution(error) => Err(error),
             };
         }
-        let checkpoint = self.state.checkpoint();
+        let checkpoint = self.state.enter_frame();
         if let Err(error) = self.create_message_account(message) {
-            self.state.rollback(checkpoint, self.features);
+            self.state.rollback_frame(checkpoint, self.features);
             return match error {
                 HostError::Halt(stop) => {
                     Ok(Self::error_message_result(stop, message.gas_limit, message.reservoir))
@@ -1193,7 +1194,13 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let input = core::mem::take(&mut message.input);
         let result = self.run_interpreter(tx_env, message);
         message.input = input;
-        let stop = result?;
+        let stop = match result {
+            Ok(stop) => stop,
+            Err(error) => {
+                self.state.rollback_frame(checkpoint, self.features);
+                return Err(error);
+            }
+        };
         self.finish_create_message_run(checkpoint, &message.destination, stop)
     }
 
@@ -1241,7 +1248,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline(never)]
     fn finish_create_message_run(
         &mut self,
-        checkpoint: StateCheckpoint,
+        checkpoint: FrameCheckpoint,
         address: &Address,
         stop: InstrStop,
     ) -> Result<MessageResult<T>, ExecutionError> {
@@ -1250,7 +1257,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let output = if stop.is_success() {
             let mut output = Bytes::copy_from_slice(interp.output());
             if let Err(stop) = self.validate_create_output(&mut gas, &mut output) {
-                self.state.rollback(checkpoint, self.features);
+                self.state.rollback_frame(checkpoint, self.features);
                 return Ok(MessageResultExt {
                     stop,
                     gas: *gas.tracker(),
@@ -1266,13 +1273,14 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 .account(address)
                 .map(|mut a| a.set_code_slow(Bytecode::new_legacy(output.clone())))
             {
-                self.state.rollback(checkpoint, self.features);
+                self.state.rollback_frame(checkpoint, self.features);
                 return Err(code.into());
             }
 
+            self.state.commit_frame(checkpoint);
             output
         } else {
-            self.state.rollback(checkpoint, self.features);
+            self.state.rollback_frame(checkpoint, self.features);
             Bytes::copy_from_slice(interp.output())
         };
 
@@ -1338,13 +1346,22 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 message.reservoir,
             ));
         }
-        let checkpoint = self.state.checkpoint();
+        let checkpoint = self.state.enter_frame();
         let transfers_balance = matches!(
             message.kind,
             MessageKind::Call | MessageKind::CallCode | MessageKind::StaticCall
         );
         if transfers_balance {
-            if !self.state.transfer(&message.caller, &message.destination, &message.value)? {
+            let transfer =
+                match self.state.transfer(&message.caller, &message.destination, &message.value) {
+                    Ok(transfer) => transfer,
+                    Err(error) => {
+                        self.state.rollback_frame(checkpoint, self.features);
+                        return Err(error.into());
+                    }
+                };
+            if !transfer {
+                self.state.commit_frame(checkpoint);
                 return Ok(Self::error_message_result(
                     InstrStop::OutOfFunds,
                     message.gas_limit,
@@ -1356,14 +1373,20 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         if self.contains_precompile(message) {
             return self.execute_call_precompile(checkpoint, message);
         }
-        let stop = self.run_interpreter(tx_env, message)?;
+        let stop = match self.run_interpreter(tx_env, message) {
+            Ok(stop) => stop,
+            Err(error) => {
+                self.state.rollback_frame(checkpoint, self.features);
+                return Err(error);
+            }
+        };
         Ok(self.finish_call_message_run(checkpoint, stop))
     }
 
     #[inline(never)]
     fn execute_call_precompile(
         &mut self,
-        checkpoint: StateCheckpoint,
+        checkpoint: FrameCheckpoint,
         message: &Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
         let mut gas =
@@ -1380,16 +1403,18 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             }
             Err(PrecompileError::Halt(_)) => (InstrStop::PrecompileError, Bytes::new()),
             Err(PrecompileError::Database(error)) => {
-                self.state.rollback(checkpoint, self.features);
+                self.state.rollback_frame(checkpoint, self.features);
                 return Err(error.into());
             }
             Err(PrecompileError::Fatal(error)) => {
-                self.state.rollback(checkpoint, self.features);
+                self.state.rollback_frame(checkpoint, self.features);
                 return Err(ExecutionError::Fatal(error));
             }
         };
         if !stop.is_success() {
-            self.state.rollback(checkpoint, self.features);
+            self.state.rollback_frame(checkpoint, self.features);
+        } else {
+            self.state.commit_frame(checkpoint);
         }
         Ok(MessageResultExt {
             stop,
@@ -1404,14 +1429,16 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline(never)]
     fn finish_call_message_run(
         &mut self,
-        checkpoint: StateCheckpoint,
+        checkpoint: FrameCheckpoint,
         stop: InstrStop,
     ) -> MessageResult<T> {
         let interp = self.interpreter_pool.last_mut().unwrap();
         let child_gas = interp.gas();
         let output = Bytes::copy_from_slice(interp.output());
         if !stop.is_success() {
-            self.state.rollback(checkpoint, self.features);
+            self.state.rollback_frame(checkpoint, self.features);
+        } else {
+            self.state.commit_frame(checkpoint);
         }
 
         MessageResultExt {
@@ -4058,3 +4085,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod live_snapshot_tests;

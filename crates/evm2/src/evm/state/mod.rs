@@ -58,6 +58,11 @@ pub struct State<'a> {
     storage_pool: storage_pool::StoragePool,
     /// Transaction-scoped EIP-1153 transient storage keyed by account address and slot.
     transient_storage: StorageKeyMap<Word>,
+    /// Active execution-frame rollback boundaries. Never copied on ordinary frame entry.
+    frames: Vec<FrameBoundary>,
+    next_frame_id: u64,
+    snapshot_owner: Arc<()>,
+    snapshot_generation: u64,
     /// Inner state.
     inner: StateInner<'a>,
 }
@@ -77,6 +82,9 @@ pub struct StateSnapshot {
     journal: Vec<JournalEntry>,
     logs: Vec<Log>,
     selfdestructs: AddressSet,
+    frames: Vec<FrameBoundary>,
+    owner: Arc<()>,
+    generation: u64,
 }
 
 impl StateSnapshot {
@@ -87,6 +95,10 @@ impl StateSnapshot {
             storage: self.storage,
             storage_pool: storage_pool::StoragePool::default(),
             transient_storage: self.transient_storage,
+            frames: Vec::new(),
+            next_frame_id: 0,
+            snapshot_owner: Arc::new(()),
+            snapshot_generation: 0,
             inner: StateInner {
                 database: CacheDB {
                     cache: self.cache,
@@ -124,6 +136,9 @@ impl State<'_> {
             journal: self.journal.clone(),
             logs: self.logs.clone(),
             selfdestructs: self.selfdestructs.clone(),
+            frames: self.frames.clone(),
+            owner: self.snapshot_owner.clone(),
+            generation: self.snapshot_generation,
         }
     }
 
@@ -131,6 +146,25 @@ impl State<'_> {
     pub fn clone_with<'a>(&self, db: impl DynDatabase + 'a) -> State<'a> {
         self.snapshot().into_state(db)
     }
+}
+
+/// A token for a registered active execution frame.
+#[derive(Debug)]
+pub(crate) struct FrameCheckpoint(u64);
+
+#[derive(Clone, Debug)]
+struct FrameBoundary {
+    id: u64,
+    checkpoint: StateCheckpoint,
+}
+
+/// Log handling when restoring a state snapshot.
+#[derive(Clone, Copy, Debug)]
+pub enum SnapshotLogs {
+    /// Restore the captured log sequence.
+    Restore,
+    /// Retain the current log sequence; ordinary frame rollback still applies.
+    Retain,
 }
 
 impl<'a> Deref for State<'a> {
@@ -182,6 +216,10 @@ impl<'a> State<'a> {
             storage: AddressMap::default(),
             storage_pool: storage_pool::StoragePool::default(),
             transient_storage: StorageKeyMap::default(),
+            frames: Vec::new(),
+            next_frame_id: 0,
+            snapshot_owner: Arc::new(()),
+            snapshot_generation: 0,
             inner: StateInner {
                 database: CacheDB::new(initial),
                 prewarm_set: PrewarmSet::new(),
@@ -192,7 +230,65 @@ impl<'a> State<'a> {
         }
     }
 
-    /// Returns a checkpoint for later rollback.
+    /// Restores an owned snapshot without replacing the backing database or rewinding execution.
+    ///
+    /// A captured frame retains its captured undo boundary. A frame entered after
+    /// capture starts a new undo scope at the restored boundary: reverting that
+    /// frame does not undo the restoration, only subsequent mutations. Captured
+    /// frames that have already returned are never resurrected.
+    ///
+    /// Engine frame boundaries captured by this state in the same transaction are preserved.
+    /// For a snapshot from a different state or transaction, every active frame starts a new undo
+    /// scope at the restored boundary. The caller must keep the backing database compatible with
+    /// the snapshot; this method restores only evm2's in-memory layers.
+    pub fn restore_snapshot(&mut self, snapshot: &StateSnapshot, logs: SnapshotLogs) {
+        let same_history = Arc::ptr_eq(&snapshot.owner, &self.snapshot_owner)
+            && snapshot.generation == self.snapshot_generation;
+        // Frames are stack ordered. Shared frame identities always form a prefix.
+        for (index, frame) in self.frames.iter_mut().enumerate() {
+            let captured = same_history
+                .then(|| snapshot.frames.get(index))
+                .flatten()
+                .filter(|saved| saved.id == frame.id);
+            frame.checkpoint.journal_len =
+                captured.map_or(snapshot.journal.len(), |saved| saved.checkpoint.journal_len);
+            if matches!(logs, SnapshotLogs::Restore) {
+                frame.checkpoint.logs_len =
+                    captured.map_or(snapshot.logs.len(), |saved| saved.checkpoint.logs_len);
+            }
+        }
+        self.accounts.clone_from(&snapshot.accounts);
+        self.storage.clone_from(&snapshot.storage);
+        self.transient_storage.clone_from(&snapshot.transient_storage);
+        self.prewarm_set.clone_from(&snapshot.prewarm_set);
+        self.journal.clone_from(&snapshot.journal);
+        self.selfdestructs.clone_from(&snapshot.selfdestructs);
+        self.database.cache.clone_from(&snapshot.cache);
+        self.database.bal_context.clone_from(&snapshot.bal_context);
+        if matches!(logs, SnapshotLogs::Restore) {
+            self.logs.clone_from(&snapshot.logs);
+        }
+    }
+
+    pub(crate) fn enter_frame(&mut self) -> FrameCheckpoint {
+        let id = self.next_frame_id;
+        self.next_frame_id = id.checked_add(1).expect("frame ID exhausted");
+        self.frames.push(FrameBoundary { id, checkpoint: self.checkpoint() });
+        FrameCheckpoint(id)
+    }
+
+    pub(crate) fn commit_frame(&mut self, token: FrameCheckpoint) {
+        let frame = self.frames.pop().expect("missing active frame");
+        assert_eq!(frame.id, token.0, "frames must settle in stack order");
+    }
+
+    pub(crate) fn rollback_frame(&mut self, token: FrameCheckpoint, features: EvmFeatures) {
+        let frame = self.frames.pop().expect("missing active frame");
+        assert_eq!(frame.id, token.0, "frames must settle in stack order");
+        self.rollback(frame.checkpoint, features);
+    }
+
+    /// Returns a raw checkpoint for later rollback.
     #[inline]
     pub const fn checkpoint(&self) -> StateCheckpoint {
         StateCheckpoint::new(self.inner.journal.len(), self.inner.logs.len())
@@ -476,12 +572,16 @@ impl<'a> State<'a> {
 
     /// Clears transaction-scoped substate.
     pub fn clear_transaction_state(&mut self) {
+        assert!(self.frames.is_empty(), "cannot clear state while frames are suspended");
+        self.snapshot_generation =
+            self.snapshot_generation.checked_add(1).expect("snapshot generation exhausted");
         let Self {
             accounts,
             storage,
             storage_pool,
             transient_storage,
             inner: StateInner { prewarm_set, journal, selfdestructs, logs, database: _ },
+            ..
         } = self;
         accounts.clear();
         storage_pool.clear(storage);
@@ -1462,3 +1562,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod live_snapshot_tests;

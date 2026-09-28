@@ -149,7 +149,9 @@ mod tests {
         constants::CALL_DEPTH_LIMIT,
         env::{BlockEnvExt, TxEnvExt},
         ethereum::{TxEnvelope, ethereum_tx_registry},
-        evm::{AccountInfo, EmptyDB, InMemoryDB, SYSTEM_ADDRESS, State},
+        evm::{
+            AccountInfo, EmptyDB, InMemoryDB, SYSTEM_ADDRESS, SnapshotLogs, State, StateSnapshot,
+        },
         interpreter::{
             GasTracker, Host, InstrStop, Interpreter, Message, MessageExt, MessageResult,
             MessageResultExt, Word, op,
@@ -1385,7 +1387,7 @@ mod tests {
     fn restored_snapshot_allows_child_and_parent_revert() {
         #[derive(Default)]
         struct SnapshotInspector {
-            snapshot: Option<State<'static>>,
+            snapshot: Option<StateSnapshot>,
             restored: bool,
             child_reverted: bool,
         }
@@ -1398,10 +1400,12 @@ mod tests {
             ) -> Option<MessageResult<BaseEvmTypes>> {
                 let marker = message.destination;
                 if marker == Address::with_last_byte(0x44) {
-                    self.snapshot = Some(interp.host().state().clone_with(EmptyDB::default()));
+                    self.snapshot = Some(interp.host().state().snapshot());
                 } else if marker == Address::with_last_byte(0x55) {
-                    *interp.host().state_mut() =
-                        self.snapshot.as_ref().unwrap().clone_with(EmptyDB::default());
+                    interp
+                        .host()
+                        .state_mut()
+                        .restore_snapshot(self.snapshot.as_ref().unwrap(), SnapshotLogs::Retain);
                     self.restored = true;
                 } else {
                     return None;
@@ -1485,7 +1489,7 @@ mod tests {
     fn snapshot_restore_preserves_logs_without_reinspection() {
         #[derive(Default)]
         struct SnapshotInspector {
-            snapshot: Option<State<'static>>,
+            snapshot: Option<StateSnapshot>,
             logs: usize,
         }
         impl Inspector<BaseEvmTypes> for SnapshotInspector {
@@ -1498,18 +1502,12 @@ mod tests {
                 message: &mut Message<BaseEvmTypes>,
             ) -> Option<MessageResult<BaseEvmTypes>> {
                 match message.destination.as_slice()[19] {
-                    0x44 => {
-                        self.snapshot = Some(interp.host().state().clone_with(EmptyDB::default()))
-                    }
+                    0x44 => self.snapshot = Some(interp.host().state().snapshot()),
                     0x55 => {
-                        let state = interp.host().state_mut();
-                        let logs = core::mem::take(state.logs_mut());
-                        let db = core::mem::replace(
-                            &mut state.overlay_db_mut().db,
-                            Box::new(EmptyDB::default()),
+                        interp.host().state_mut().restore_snapshot(
+                            self.snapshot.as_ref().unwrap(),
+                            SnapshotLogs::Retain,
                         );
-                        *state = self.snapshot.as_ref().unwrap().clone_with(db);
-                        *state.logs_mut() = logs;
                     }
                     _ => return None,
                 }

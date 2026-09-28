@@ -40,6 +40,8 @@ fn main() -> Result<()> {
 
 See [`crates/evm2/examples/custom_evm`](crates/evm2/examples/custom_evm) for the complete version.
 
+See [live transaction snapshots](docs/live-state-snapshots.md) for callback-time state restoration.
+
 ## Feature flags
 
 All features of the `evm2` crate are listed below. Use `default-features = false` to disable the default set.

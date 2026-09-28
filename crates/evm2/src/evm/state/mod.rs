@@ -945,6 +945,9 @@ impl<'a> State<'a> {
                         slot.value.current = previous;
                     }
                 }
+                JournalEntry::StorageWipe { address, previous } => {
+                    self.storage.insert(address, previous);
+                }
                 JournalEntry::TransientStorageChange { address, key, previous } => match previous {
                     Some(previous) if !previous.is_zero() => {
                         self.transient_storage.insert(StorageKey::new(address, key), previous);

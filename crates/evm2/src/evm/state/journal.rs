@@ -1,6 +1,6 @@
 //! Revert journal and checkpoint types.
 
-use super::AccountInfo;
+use super::{AccountInfo, StorageOverlay};
 use crate::interpreter::Word;
 use alloy_primitives::Address;
 
@@ -65,6 +65,13 @@ pub enum JournalEntry {
         key: Word,
         /// Previous current storage value.
         previous: Word,
+    },
+    /// Persistent storage was wiped during a revertible execution scope.
+    StorageWipe {
+        /// Account address.
+        address: Address,
+        /// Storage overlay before the wipe.
+        previous: StorageOverlay,
     },
     /// Transient storage changed.
     TransientStorageChange {

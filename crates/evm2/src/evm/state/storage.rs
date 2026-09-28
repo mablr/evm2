@@ -213,6 +213,17 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
             slot.value.set_current(Word::ZERO);
         });
     }
+
+    /// Wipes storage within a revertible execution scope.
+    ///
+    /// Unlike [`Self::wipe`], this records the prior overlay so frame rollback restores it.
+    pub fn wipe_journaled(&mut self) {
+        self.inner.journal.push(JournalEntry::StorageWipe {
+            address: self.address,
+            previous: self.storage.clone(),
+        });
+        self.wipe();
+    }
 }
 
 /// A mutable, journaled handle to a single, loaded persistent storage slot.
@@ -409,6 +420,25 @@ mod tests {
         let overlay = pending.storage.get(&account).expect("wipe must be emitted");
         assert!(overlay.wiped);
         assert!(overlay.changed_slots().next().is_none());
+    }
+
+    #[test]
+    fn journaled_storage_wipe_rolls_back_loaded_values() {
+        let account = Address::with_last_byte(0x19);
+        let key = Word::from(1);
+        let mut database = CacheDB::default();
+        database.insert_account_info(&account, AccountInfo::default());
+        database.insert_account_storage(&account, &key, &Word::from(3));
+        let mut state = State::new(database);
+        state.storage_slot(&account, key).unwrap().write(Word::from(5));
+        let checkpoint = state.checkpoint();
+
+        state.storage(&account).wipe_journaled();
+        assert_eq!(state.storage_slot(&account, key).unwrap().current(), Word::ZERO);
+
+        state.rollback(checkpoint, Version::base(SpecId::CANCUN).features);
+        assert!(!state.storage(&account).is_wiped());
+        assert_eq!(state.storage_slot(&account, key).unwrap().current(), Word::from(5));
     }
 
     #[test]

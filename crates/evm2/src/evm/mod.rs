@@ -111,7 +111,7 @@
 //! ```
 
 use self::{
-    inspector::{Inspector, boxed_inspector},
+    inspector::{CallAction, Inspector, boxed_inspector},
     precompile::{PrecompileOutput, PrecompileProvider, boxed_precompile_provider},
 };
 use crate::{
@@ -1091,12 +1091,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         message: &'frame mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
         let guard = self.enter_execution();
-        let Some(inspector) = guard.evm.inspector.as_deref_mut() else {
+        if guard.evm.inspector.is_none() {
             return guard.evm.execute_message_impl(tx_env, message);
-        };
-        // SAFETY: The inspector is stored in `self`; the execution guard prevents inspector
-        // replacement while the hooks are running.
-        let inspector = unsafe { trustme::decouple_lt_mut(inspector) };
+        }
 
         // `destination` already holds the create's contract address (set when the message was
         // constructed), so the create hook observes it directly.
@@ -1127,17 +1124,34 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         // SAFETY: The frame outlives the hook invocations below.
         let frame = unsafe { trustme::decouple_lt_mut(frame) };
 
-        let inspected = if is_create {
-            inspector.create(frame, message)
-        } else {
-            inspector.call(frame, message)
+        let action = {
+            let inspector = guard.evm.inspector.as_deref_mut().unwrap();
+            // SAFETY: The inspector is stored in `self`; the execution guard prevents inspector
+            // replacement while the hook is running.
+            let inspector = unsafe { trustme::decouple_lt_mut(inspector) };
+            if is_create {
+                inspector.create(frame, message).map_or(CallAction::Continue, CallAction::Override)
+            } else {
+                inspector.call_action(frame, message)
+            }
         };
 
         let mut result = if let Some(error) = frame.take_error() {
             Err(error)
         } else {
-            inspected.map(Ok).unwrap_or_else(|| guard.evm.execute_message_impl(tx_env, message))
+            match action {
+                CallAction::Continue => guard.evm.execute_message_impl(tx_env, message),
+                CallAction::Override(result) => Ok(result),
+                CallAction::Execute(mut child) => {
+                    guard.evm.execute_message_inspected(tx_env, &mut child)
+                }
+            }
         };
+
+        let inspector = guard.evm.inspector.as_deref_mut().unwrap();
+        // SAFETY: The previous hook has returned, and the execution guard prevents inspector
+        // replacement while this hook runs.
+        let inspector = unsafe { trustme::decouple_lt_mut(inspector) };
 
         if let Ok(result) = &mut result {
             if is_create {

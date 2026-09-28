@@ -9,6 +9,20 @@ use alloc::boxed::Box;
 use alloy_primitives::{Address, Log, U256};
 use auto_impl::auto_impl;
 
+/// Work requested by an inspector before a call executes.
+#[derive(Debug)]
+pub enum CallAction<T: EvmTypesHost> {
+    /// Execute the original call.
+    Continue,
+    /// Return a result without executing the call.
+    Override(MessageResult<T>),
+    /// Execute a child message after the inspector hook returns.
+    ///
+    /// The child is inspected normally. The original call's `call_end` hook receives its result
+    /// and may translate it before the caller observes it.
+    Execute(Box<Message<T>>),
+}
+
 /// EVM execution inspector.
 #[auto_impl(&mut, Box)]
 pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
@@ -50,6 +64,19 @@ pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
         let _ = interp;
         let _ = message;
         None
+    }
+
+    /// Selects how to execute a call, including an inspected child message.
+    ///
+    /// Returning a child message avoids re-entering this inspector while its `call` hook is
+    /// borrowed. Implementations that only override calls can keep implementing [`Self::call`].
+    #[inline]
+    fn call_action(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &mut Message<T>,
+    ) -> CallAction<T> {
+        self.call(interp, message).map_or(CallAction::Continue, CallAction::Override)
     }
 
     /// Called after a call message executes.
@@ -141,7 +168,7 @@ impl<'a, T: EvmTypesHost> core::ops::DerefMut for dyn Inspector<T> + 'a {
 
 #[cfg(test)]
 mod tests {
-    use super::Inspector;
+    use super::{CallAction, Inspector};
     use crate::{
         BaseEvmConfigSelector, BaseEvmTypes, DatabaseError, Evm, EvmTypesHost, ExecutionConfig,
         Precompiles, SpecId,
@@ -153,8 +180,8 @@ mod tests {
             AccountInfo, EmptyDB, InMemoryDB, SYSTEM_ADDRESS, SnapshotLogs, State, StateSnapshot,
         },
         interpreter::{
-            GasTracker, Host, InstrStop, Interpreter, Message, MessageExt, MessageResult,
-            MessageResultExt, Word, op,
+            GasTracker, Host, InstrStop, Interpreter, Message, MessageExt, MessageKind,
+            MessageResult, MessageResultExt, Word, derive_create_destination, op,
         },
         registry::TxRegistry,
         test_utils::{TestHost, TestTypes, legacy_bytecode, push, push_all},
@@ -762,6 +789,86 @@ mod tests {
         assert_eq!(Word::from_be_slice(&result.output), Word::from(3));
         assert_eq!(inspector.call_depth, Some(1));
         assert_eq!(inspector.call_end_stop, Some(InstrStop::Return));
+    }
+
+    #[test]
+    fn call_action_executes_inspected_create_after_hook_returns() {
+        #[derive(Default)]
+        struct CreateFromCall {
+            hooks: Vec<&'static str>,
+        }
+
+        impl Inspector<BaseEvmTypes> for CreateFromCall {
+            fn call_action(
+                &mut self,
+                _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> CallAction<BaseEvmTypes> {
+                self.hooks.push("call");
+                let init_code = Bytes::from_static(&[op::PUSH0, op::PUSH0, op::RETURN]);
+                let caller = message.caller;
+                let destination = derive_create_destination(
+                    MessageKind::Create,
+                    &caller,
+                    &Default::default(),
+                    &init_code,
+                    0,
+                );
+                let child = MessageExt {
+                    kind: MessageKind::Create,
+                    depth: message.depth + 1,
+                    gas_limit: message.gas_limit,
+                    destination,
+                    call_target: destination,
+                    caller,
+                    input: init_code.clone(),
+                    code: legacy_bytecode(init_code.to_vec()),
+                    code_address: destination,
+                    ..Default::default()
+                };
+                CallAction::Execute(Box::new(child))
+            }
+
+            fn create(
+                &mut self,
+                _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                _message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                self.hooks.push("create");
+                None
+            }
+
+            fn create_end(
+                &mut self,
+                _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                _message: &Message<BaseEvmTypes>,
+                _result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                self.hooks.push("create_end");
+            }
+
+            fn call_end(
+                &mut self,
+                _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                _message: &Message<BaseEvmTypes>,
+                result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                self.hooks.push("call_end");
+                assert!(result.is_success());
+                result.output = Bytes::copy_from_slice(result.created_address.unwrap().as_slice());
+            }
+        }
+
+        let caller = Address::with_last_byte(1);
+        let (result, inspector, _) = run_evm_with_inspector(
+            vec![op::STOP],
+            &MessageExt { caller, ..Default::default() },
+            100_000,
+            CreateFromCall::default(),
+        );
+        assert!(result.is_success());
+        assert_eq!(inspector.hooks, ["call", "create", "create_end", "call_end"]);
+        assert_eq!(result.output.len(), 20);
     }
 
     #[test]

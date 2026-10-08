@@ -89,10 +89,15 @@ fn dispatch_inner<T: EvmTypesHost, C: EvmConfig<T>, M: InspectMode<T>, G: Dispat
         Ok(()) => {
             gas.sync_before_exec(state, dynamic_gas);
             r = instr(&mut pc, stack.reborrow(), state);
+            gas.sync_after_exec(state, dynamic_gas);
+            // Only instructions accessing mutable gas can prepare messages.
+            if dynamic_gas && state.has_pending_message() {
+                state.set_pc_stack_len(pc.as_ptr(), stack.len());
+                return (Pc::new(core::ptr::null()), gas);
+            }
             if r.is_ok() {
                 inc_pc(&mut pc, op);
             }
-            gas.sync_after_exec(state, dynamic_gas);
         }
         Err(e) => {
             gas.sync_before_exec(state, false);
@@ -112,9 +117,10 @@ fn dispatch_inner<T: EvmTypesHost, C: EvmConfig<T>, M: InspectMode<T>, G: Dispat
 pub(in crate::interpreter) fn run<T: EvmTypesHost>(
     interpreter: &mut Interpreter<'_, '_, T>,
     instructions: &RawInstrTable<T>,
-) -> InstrStop {
+    step_opcodes: bool,
+) -> Option<InstrStop> {
     let (state, pc, stack) = run_state(interpreter);
-    if state.is_inspecting() {
+    if step_opcodes {
         return run_inner::<T, DynInspector>(state, pc, stack, instructions);
     }
     run_inner::<T, NoInspector>(state, pc, stack, instructions)
@@ -126,7 +132,7 @@ fn run_inner<T: EvmTypesHost, M: InspectMode<T>>(
     mut pc: Pc,
     mut stack: RawStack<'_>,
     instructions: &RawInstrTable<T>,
-) -> InstrStop {
+) -> Option<InstrStop> {
     let mut loop_state = imp::loop_state(state.gas_mut());
     loop {
         if M::INSPECT {
@@ -148,6 +154,10 @@ fn run_inner<T: EvmTypesHost, M: InspectMode<T>>(
         pc = next_pc;
         stack.set_len(next_stack_len);
 
+        // A NULL PC with a successful result means CALL/CREATE yielded before step_end.
+        if pc.as_ptr().is_null() {
+            return finish_run(state, pc, stack.len(), loop_state);
+        }
         if M::INSPECT {
             imp::sync_loop_state(state, loop_state);
             M::step_end(state, pc, stack.len());
@@ -155,8 +165,6 @@ fn run_inner<T: EvmTypesHost, M: InspectMode<T>>(
             if state.result().is_err() {
                 return finish_run(state, pc, stack.len(), loop_state);
             }
-        } else if pc.as_ptr().is_null() {
-            return finish_run(state, pc, stack.len(), loop_state);
         }
     }
 }
@@ -167,11 +175,11 @@ fn finish_run<T: EvmTypesHost>(
     pc: Pc,
     stack_len: usize,
     loop_state: imp::LoopState,
-) -> InstrStop {
+) -> Option<InstrStop> {
     cold_path();
     // The NULL `pc` is only a loop-exit sentinel; never publish it.
-    let pc = if pc.as_ptr().is_null() { state.bytecode().as_slice().as_ptr() } else { pc.as_ptr() };
+    let pc = if pc.as_ptr().is_null() { state.0.pc } else { pc.as_ptr() };
     state.set_pc_stack_len(pc, stack_len);
     imp::finish_loop(state.gas_mut(), loop_state);
-    state.result().unwrap_err()
+    state.result().err()
 }

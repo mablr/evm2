@@ -6,7 +6,7 @@ use crate::{
     constants::CALL_DEPTH_LIMIT,
     interpreter::{
         Gas, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind, Result, StackMut,
-        Word, derive_create_destination,
+        Word, derive_create_destination, runtime::MessageCompletion,
     },
     utils::{word_to_address, word_to_usize},
     version::GasId,
@@ -157,9 +157,7 @@ fn prepare_call<T: EvmTypesHost>(
     gas: &mut Gas,
     state: &mut InterpreterState<'_, '_, T>,
     kind: MessageKind,
-    message: &mut Message<T>,
-    return_memory_range: &mut Range<usize>,
-) -> Result<u64> {
+) -> Result<(Message<T>, MessageCompletion)> {
     let has_value = match kind {
         MessageKind::Call | MessageKind::CallCode => true,
         MessageKind::DelegateCall | MessageKind::StaticCall => false,
@@ -175,7 +173,7 @@ fn prepare_call<T: EvmTypesHost>(
     }
 
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
-    let (input_range, prepared_return_memory_range) = get_memory_input_and_out_ranges(
+    let (input_range, return_memory_range) = get_memory_input_and_out_ranges(
         gas,
         state,
         input_offset,
@@ -206,7 +204,7 @@ fn prepare_call<T: EvmTypesHost>(
         MessageKind::StaticCall => (to, current.destination, Word::ZERO, resolved_code_address),
         _ => unreachable!("invalid call message kind"),
     };
-    *message = MessageExt {
+    let message = MessageExt {
         kind,
         depth: current.depth.saturating_add(1),
         gas_limit,
@@ -224,78 +222,87 @@ fn prepare_call<T: EvmTypesHost>(
         ext: T::MessageExt::default(),
         _non_exhaustive: (),
     };
-    *return_memory_range = prepared_return_memory_range;
-
-    Ok(new_account_state_gas)
+    Ok((message, MessageCompletion::Call { output: return_memory_range, new_account_state_gas }))
 }
 
 #[inline(never)]
 fn call_inner<T: EvmTypesHost>(
     mut stack: StackMut<'_>,
-    gas: &mut Gas,
     state: &mut InterpreterState<'_, '_, T>,
     kind: MessageKind,
 ) -> Result {
-    let mut message = Message::<T>::default();
-    let mut return_memory_range = 0..0;
-    let new_account_state_gas =
-        prepare_call(stack.reborrow(), gas, state, kind, &mut message, &mut return_memory_range)?;
+    // Keep gas separate from the state borrow during preparation, including error paths.
+    let mut gas = *state.gas_mut();
+    let prepared = prepare_call(stack.reborrow(), &mut gas, state, kind);
+    *state.gas_mut() = gas;
+    let (mut message, completion) = prepared?;
 
+    if state.has_inspector() {
+        state.suspend_message(message, completion);
+        return Ok(());
+    }
     let tx_env = state.tx();
-    let mut result =
-        state.host().execute_message(tx_env, &mut message).map_err(|error| state.fail(error))?;
-    if result.stop.is_fatal() {
-        return Err(result.stop);
-    }
-    gas.merge_child_gas(result.gas, result.stop);
-    // EIP-8037: a value-bearing CALL that creates the target charges NEW_ACCOUNT state
-    // gas upfront on this frame. If the call does not succeed (depth/balance failure,
-    // child revert or halt) the target is not created, so refund the upfront charge to
-    // the reservoir (execution-specs `credit_state_gas_refund`), mirroring CREATE.
-    if new_account_state_gas != 0 && !result.stop.is_success() {
-        gas.refill_reservoir(new_account_state_gas);
-    }
-    let copy_len = min(return_memory_range.len(), result.output.len());
-    unsafe {
-        let output = result.output.get_unchecked(..copy_len);
-        state.memory().set_unchecked(return_memory_range.start, output);
-    }
-    state.swap_return_data(&mut result.output);
-    stack.push(Word::from(result.stop.is_success()))
+    let result = state
+        .host()
+        .execute_message(tx_env, &mut message, None)
+        .map_err(|error| state.fail(error))?;
+    state.complete_message(stack, completion, result)
 }
 
-#[instruction(no_stack_preamble, dynamic_gas)]
+#[instruction(no_stack_preamble, dynamic_gas, no_gas_preamble)]
 pub fn call(cx: _) -> Result {
-    call_inner(stack, cx.gas, cx.state, MessageKind::Call)
+    call_inner(stack, cx.state, MessageKind::Call)
 }
 
-#[instruction(no_stack_preamble, dynamic_gas)]
+#[instruction(no_stack_preamble, dynamic_gas, no_gas_preamble)]
 pub fn callcode(cx: _) -> Result {
-    call_inner(stack, cx.gas, cx.state, MessageKind::CallCode)
+    call_inner(stack, cx.state, MessageKind::CallCode)
 }
 
-#[instruction(no_stack_preamble, dynamic_gas)]
+#[instruction(no_stack_preamble, dynamic_gas, no_gas_preamble)]
 pub fn delegatecall(cx: _) -> Result {
-    call_inner(stack, cx.gas, cx.state, MessageKind::DelegateCall)
+    call_inner(stack, cx.state, MessageKind::DelegateCall)
 }
 
-#[instruction(no_stack_preamble, dynamic_gas)]
+#[instruction(no_stack_preamble, dynamic_gas, no_gas_preamble)]
 pub fn staticcall(cx: _) -> Result {
-    call_inner(stack, cx.gas, cx.state, MessageKind::StaticCall)
+    call_inner(stack, cx.state, MessageKind::StaticCall)
 }
 
-#[instruction(no_stack_preamble, dynamic_gas)]
+#[instruction(no_stack_preamble, dynamic_gas, no_gas_preamble)]
 pub fn create<const IS_CREATE2: bool>(cx: _) -> Result {
-    create_inner(stack, cx.gas, cx.state, IS_CREATE2)
+    create_inner(stack, cx.state, IS_CREATE2)
 }
 
 #[inline(never)]
 fn create_inner<T: EvmTypesHost>(
     mut stack: StackMut<'_>,
-    gas: &mut Gas,
     state: &mut InterpreterState<'_, '_, T>,
     is_create2: bool,
 ) -> Result {
+    let mut gas = *state.gas_mut();
+    let prepared = prepare_create(stack.reborrow(), &mut gas, state, is_create2);
+    *state.gas_mut() = gas;
+    let Some((mut message, completion)) = prepared? else { return Ok(()) };
+    if state.has_inspector() {
+        state.suspend_message(message, completion);
+        return Ok(());
+    }
+    let tx_env = state.tx();
+    let result = state
+        .host()
+        .execute_message(tx_env, &mut message, None)
+        .map_err(|error| state.fail(error))?;
+    state.complete_message(stack, completion, result)
+}
+
+#[inline(never)]
+fn prepare_create<T: EvmTypesHost>(
+    mut stack: StackMut<'_>,
+    gas: &mut Gas,
+    state: &mut InterpreterState<'_, '_, T>,
+    is_create2: bool,
+) -> Result<Option<(Message<T>, MessageCompletion)>> {
     require_non_staticcall(state)?;
 
     let [value, offset, len] = stack.popn::<3>()?;
@@ -356,7 +363,7 @@ fn create_inner<T: EvmTypesHost>(
         {
             state.clear_return_data();
             stack.push(Word::ZERO)?;
-            return Ok(());
+            return Ok(None);
         }
 
         // The destination is loaded here and made warm. Balance, nonce, and depth pre-access
@@ -378,8 +385,7 @@ fn create_inner<T: EvmTypesHost>(
     };
     gas.spend(gas_limit)?;
 
-    let tx_env = state.tx();
-    let mut message = MessageExt {
+    let message = MessageExt {
         kind,
         depth,
         gas_limit,
@@ -398,29 +404,14 @@ fn create_inner<T: EvmTypesHost>(
         ext: T::MessageExt::default(),
         _non_exhaustive: (),
     };
-    let mut result =
-        state.host().execute_message(tx_env, &mut message).map_err(|error| state.fail(error))?;
-    if result.stop.is_fatal() {
-        return Err(result.stop);
-    }
-    gas.merge_child_gas(result.gas, result.stop);
-
-    // EIP-8037: when the opcode charged the conditional `create_state_gas`
-    // and the create then fails to deploy (revert, halt, or an early-fail leaving
-    // `created_address == None` — depth, out-of-funds, nonce overflow), no new account leaf is
-    // created, so refund the charge to the reservoir via `refill_reservoir` (matching 0→x→0 storage
-    // restoration). A successful deployment keeps the charge; an alive target was never charged.
-    let create_failed = result.created_address.is_none() || !result.stop.is_success();
-    if charged_create_state_gas && create_failed {
-        gas.refill_reservoir(state.gas_params().create_state_gas());
-    }
-    // EIP-211 exposes CREATE failure data only for REVERT; other failures clear returndata.
-    if result.stop == InstrStop::Revert {
-        state.swap_return_data(&mut result.output);
-    } else {
-        state.clear_return_data();
-    }
-    stack.push(result.created_address_for_parent())
+    let completion = MessageCompletion::Create {
+        new_account_state_gas: if charged_create_state_gas {
+            state.gas_params().create_state_gas()
+        } else {
+            0
+        },
+    };
+    Ok(Some((message, completion)))
 }
 
 #[instruction(dynamic_gas)]

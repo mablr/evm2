@@ -1,19 +1,19 @@
 use super::{
-    BytecodeRef, Gas, InstrStop, Memory, Message, MessageKind, Pc, Result, StackBacking, StackMut,
-    StackRef, Word,
+    BytecodeRef, Gas, Host, InstrStop, Memory, Message, MessageKind, MessageResult, Pc, Result,
+    StackBacking, StackMut, StackRef, Word,
 };
 use crate::{
-    EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId, Version,
+    EvmTypesHost, ExecutionConfig, ExecutionError, HostError, InterpreterRunner, SpecId, Version,
     bytecode::Bytecode,
     env::TxEnv,
-    evm::inspector::Inspector,
+    evm::{NonStaticAny, inspector::Inspector},
     interpreter::dispatch::{self, InstrTable},
     trustme,
     version::{EvmFeatures, GasParams},
 };
 use alloc::{boxed::Box, vec::Vec};
 use alloy_primitives::{Address, B256, Bytes};
-use core::{fmt, hint::cold_path, ops::Range, ptr::NonNull};
+use core::{any::TypeId, cmp::min, fmt, hint::cold_path, ops::Range, ptr::NonNull};
 use derive_where::derive_where;
 
 /// EVM interpreter.
@@ -33,6 +33,8 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     #[derive_where(skip)]
     message: Option<&'frame Message<T>>,
     host: Option<NonNull<T::Host<'host>>>,
+    host_type_id: Option<TypeId>,
+    host_bound: bool,
     inspector: Option<NonNull<dyn Inspector<T> + 'host>>,
     version: Option<&'frame Version>,
     pub(in crate::interpreter) stack_len: usize,
@@ -45,6 +47,7 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     spec: SpecId,
     features: EvmFeatures,
     is_static: bool,
+    pending_message: Option<PendingMessage<T>>,
 }
 
 // SAFETY: The interpreter's internal pointers are always valid. `pc` and `bytecode_ref` point into
@@ -88,8 +91,11 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             tx_env: None,
             message: None,
             is_static: false,
+            pending_message: None,
             return_data: Bytes::new(),
             host: None,
+            host_type_id: None,
+            host_bound: false,
             inspector: None,
             version: None,
             spec: SpecId::DEFAULT,
@@ -119,12 +125,15 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.return_data = Bytes::new();
     }
 
-    pub(crate) const fn clear_frame_refs(&mut self) {
+    pub(crate) fn clear_frame_refs(&mut self) {
         self.tx_env = None;
         self.message = None;
         self.version = None;
         self.host = None;
+        self.host_type_id = None;
+        self.host_bound = false;
         self.inspector = None;
+        self.pending_message = None;
     }
 
     #[cfg(test)]
@@ -292,15 +301,18 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     pub const fn stack_memory_host(&mut self) -> (StackRef<'_>, &[u8], &mut T::Host<'host>) {
         // SAFETY: As in `host`, the host pointer is initialized during execution and points
         // outside the interpreter's owned stack and memory.
-        let host = unsafe { self.host.unwrap_unchecked().as_mut() };
+        let host = unsafe { self.host_ptr().as_mut() };
         (self.stack(), self.memory.as_slice(), host)
     }
 
     /// Returns the host implementation.
+    ///
+    /// Suspended message callbacks must bind host access with [`Self::with_host`].
+    /// Panics when host access is not bound.
     #[inline]
     pub const fn host(&mut self) -> &mut T::Host<'host> {
         // SAFETY: `host` is initialized at the beginning of inspected execution.
-        unsafe { self.host.unwrap_unchecked().as_mut() }
+        unsafe { self.host_ptr().as_mut() }
     }
 
     /// Returns the active base specification ID.
@@ -344,6 +356,8 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Finishes a backend run, returning its owned error and clearing execution references.
     pub(crate) fn finish_run(&mut self, stop: InstrStop) -> Result<InstrStop, ExecutionError> {
         self.host = None;
+        self.host_type_id = None;
+        self.host_bound = false;
         self.inspector = None;
         if let Some(error) = self.take_error() {
             return Err(error);
@@ -356,14 +370,23 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         Ok(stop)
     }
 
-    /// Runs the interpreter until it stops.
+    /// Runs the interpreter until it stops without opcode stepping.
+    ///
+    /// Retains any frame inspector installed by the EVM for external execution.
     #[inline]
     pub fn run(
         &mut self,
         config: &ExecutionConfig<T>,
         host: &mut T::Host<'host>,
     ) -> Result<InstrStop, ExecutionError> {
-        self.run_inner(config.base_spec_id(), config.version(), host, None, config.instructions)
+        self.run_inner(
+            config.base_spec_id(),
+            config.version(),
+            host,
+            self.inspector,
+            config.instructions,
+            false,
+        )
     }
 
     /// Runs the interpreter until it stops with an execution inspector.
@@ -374,16 +397,38 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         host: &mut T::Host<'host>,
         inspector: &mut (dyn Inspector<T> + 'host),
     ) -> Result<InstrStop, ExecutionError> {
+        let step_opcodes = !inspector.inspected_opcodes().is_empty();
+        self.run_with_inspector(config, host, inspector, step_opcodes, None)
+    }
+
+    /// Runs with retained inspector hooks and optional per-opcode callbacks.
+    pub(crate) fn run_with_inspector(
+        &mut self,
+        config: &ExecutionConfig<T>,
+        host: &mut T::Host<'host>,
+        inspector: &mut (dyn Inspector<T> + 'host),
+        step_opcodes: bool,
+        runner: Option<&dyn InterpreterRunner<T>>,
+    ) -> Result<InstrStop, ExecutionError> {
+        let inspector = Some(NonNull::from(inspector));
+        if !step_opcodes && let Some(runner) = runner {
+            self.prepare_run(config.base_spec_id(), config.version(), host);
+            self.inspector = inspector;
+            if let Some(stop) = runner.run(config, self, host) {
+                return self.finish_run(stop);
+            }
+        }
         self.run_inner(
             config.base_spec_id(),
             config.version(),
             host,
-            Some(NonNull::from(inspector)),
-            config.inspect_instructions,
+            inspector,
+            if step_opcodes { config.inspect_instructions } else { config.instructions },
+            step_opcodes,
         )
     }
 
-    /// Prepares this interpreter for external execution.
+    /// Prepares this interpreter for external execution, retaining its frame inspector.
     #[inline]
     #[doc(hidden)]
     pub fn prepare_run(&mut self, spec: SpecId, version: &Version, host: &mut T::Host<'host>) {
@@ -397,8 +442,9 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.memory.set_memory_limit(version.memory_limit);
         // SAFETY: `version` remains alive for the duration of this interpreter run.
         let version = unsafe { trustme::decouple_lt(version) };
+        self.host_type_id = Some(NonStaticAny::type_id(host));
         self.host = Some(NonNull::from(host));
-        self.inspector = None;
+        self.host_bound = true;
         self.version = Some(version);
         self.spec = spec;
         self.features = version.features;
@@ -412,14 +458,60 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         host: &mut T::Host<'host>,
         inspector: Option<NonNull<dyn Inspector<T> + 'host>>,
         instructions: &InstrTable<T>,
+        step_opcodes: bool,
     ) -> Result<InstrStop, ExecutionError> {
         self.prepare_run(spec, version, host);
         self.inspector = inspector;
 
-        let stop = if self.error.is_some() {
-            InstrStop::FatalExternalError
-        } else {
-            dispatch::run(self, instructions)
+        let stop = loop {
+            if self.error.is_some() {
+                break InstrStop::FatalExternalError;
+            }
+            if let Err(stop) = self.result {
+                break stop;
+            }
+            if let Some(stop) = dispatch::run(self, instructions, step_opcodes) {
+                break stop;
+            }
+
+            // Dispatch has returned: no instruction gas or stack references remain alive.
+            let PendingMessage { mut message, completion } =
+                self.pending_message.take().expect("dispatch yielded a message");
+            let mut pc = Pc::new(self.pc);
+            let op = pc.op();
+            let tx_env = self.tx_env();
+            let host_type_id = self.host_type_id;
+            let result = {
+                self.suspend_host();
+                let guard = SuspendedHost { interpreter: self };
+                host.execute_message(tx_env, &mut message, Some(&mut *guard.interpreter))
+            };
+            // Host execution creates fresh reborrows; refresh the pointer before later step hooks.
+            self.host_type_id = host_type_id;
+            self.host = Some(NonNull::from(&mut *host));
+            self.host_bound = true;
+            let result = match result {
+                Ok(result) => complete_message::<T>(
+                    StackMut { stack: &mut self.stack, len: &mut self.stack_len },
+                    &mut self.gas,
+                    &mut self.memory,
+                    &mut self.return_data,
+                    completion,
+                    result,
+                ),
+                Err(error) => Err(self.fail(error)),
+            };
+            if self.result.is_ok() {
+                self.result = result;
+            }
+            if result.is_ok() {
+                dispatch::inc_pc(&mut pc, op);
+            }
+            self.pc = pc.as_ptr();
+            if step_opcodes {
+                let stack_len = self.stack_len;
+                InterpreterState::wrap_mut(self).inspect_step_end(pc, stack_len);
+            }
         };
         self.finish_run(stop)
     }
@@ -427,6 +519,53 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Takes an owned error recorded by an instruction or inspector hook.
     pub(crate) const fn take_error(&mut self) -> Option<ExecutionError> {
         self.error.take()
+    }
+
+    /// Runs a suspended parent's callback with access to its host.
+    ///
+    /// Custom [`Host::execute_message`] implementations must use this scope before callbacks
+    /// access [`Self::host`] or [`Self::stack_memory_host`]. Direct host access and child execution
+    /// happen outside the scope; bind a fresh scope for each subsequent callback. Access is
+    /// revoked when the callback returns or unwinds.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless host access is suspended and `host` is the host used to prepare this frame.
+    pub fn with_host<'bound, R>(
+        &mut self,
+        host: &mut T::Host<'bound>,
+        callback: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        assert!(!self.host_bound, "host access is already bound");
+        assert_eq!(
+            self.host_type_id,
+            Some(NonStaticAny::type_id(host)),
+            "parent belongs to a different host type"
+        );
+        let host = NonNull::from(host);
+        assert_eq!(
+            self.host.map(NonNull::cast::<()>),
+            Some(host.cast::<()>()),
+            "parent belongs to a different host"
+        );
+        // SAFETY: The same original host object and concrete lifetime-erased type were checked.
+        // T's host family differs only by stored-object lifetimes, so the pointer layout matches.
+        // Copying preserves the fresh reborrow's provenance and metadata (vtable addresses need
+        // not be identical for two coercions of the same trait-object host). HostBinding revokes
+        // access before the reborrow ends, including when the callback unwinds.
+        self.host = Some(unsafe { core::mem::transmute_copy(&host) });
+        self.host_bound = true;
+        let guard = HostBinding { interpreter: self };
+        callback(&mut *guard.interpreter)
+    }
+
+    pub(crate) const fn suspend_host(&mut self) {
+        self.host_bound = false;
+    }
+
+    const fn host_ptr(&self) -> NonNull<T::Host<'host>> {
+        assert!(self.host_bound, "suspended host access requires Interpreter::with_host");
+        self.host.expect("host is initialized while bound")
     }
 }
 
@@ -480,12 +619,6 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
     }
 
     #[inline]
-    #[cfg(not(tco))]
-    pub(crate) const fn is_inspecting(&self) -> bool {
-        self.0.inspector.is_some()
-    }
-
-    #[inline]
     pub(crate) const fn set_pc_stack_len(&mut self, pc: *const u8, stack_len: usize) {
         self.0.pc = pc;
         self.0.stack_len = stack_len;
@@ -519,7 +652,7 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
         // SAFETY: `host` is initialized at the beginning of `run` and cleared before the
         // method returns. Instruction execution is synchronous, so the pointer cannot outlive the
         // `run` host borrow.
-        unsafe { self.0.host.unwrap_unchecked().as_mut() }
+        self.0.host()
     }
 
     /// Returns the active runtime version data.
@@ -586,12 +719,6 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
         self.0.return_data.clear();
     }
 
-    /// Swaps return data from the last call-like operation.
-    #[inline]
-    pub(crate) const fn swap_return_data(&mut self, return_data: &mut Bytes) {
-        core::mem::swap(&mut self.0.return_data, return_data);
-    }
-
     /// Returns the current frame output memory range.
     #[inline]
     pub const fn output_range(&self) -> &Range<u32> {
@@ -638,10 +765,40 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
     ) {
         if let Some(mut inspector) = self.0.inspector {
             unsafe {
-                let mut host = self.0.host.unwrap_unchecked();
+                let mut host = self.0.host_ptr();
                 inspector.as_mut().selfdestruct(contract, target, value, host.as_mut());
             }
         }
+    }
+
+    #[inline]
+    pub(crate) const fn has_inspector(&self) -> bool {
+        self.0.inspector.is_some()
+    }
+
+    #[inline]
+    pub(crate) const fn has_pending_message(&self) -> bool {
+        self.0.pending_message.is_some()
+    }
+
+    pub(crate) fn suspend_message(&mut self, message: Message<T>, completion: MessageCompletion) {
+        self.0.pending_message = Some(PendingMessage { message, completion });
+    }
+
+    pub(crate) fn complete_message(
+        &mut self,
+        stack: StackMut<'_>,
+        completion: MessageCompletion,
+        result: MessageResult<T>,
+    ) -> Result {
+        complete_message::<T>(
+            stack,
+            &mut self.0.gas,
+            &mut self.0.memory,
+            &mut self.0.return_data,
+            completion,
+            result,
+        )
     }
 }
 
@@ -698,7 +855,12 @@ impl<T: EvmTypesHost> InterpreterPool<T> {
 #[cfg(test)]
 mod owned_error_tests {
     use super::*;
-    use crate::{DatabaseError, env::TxEnvExt, interpreter::MessageExt, test_utils::TestTypes};
+    use crate::{
+        BaseEvmConfig, DatabaseError,
+        env::TxEnvExt,
+        interpreter::{GasTracker, MessageExt, MessageResultExt, OpcodeSet, op},
+        test_utils::{TestHost, TestTypes},
+    };
 
     #[test]
     fn owned_error_is_taken_on_exit() {
@@ -711,5 +873,201 @@ mod owned_error_tests {
         assert_eq!(result, Err(ExecutionError::Database(error)));
         assert!(interpreter.error.is_none());
         assert_eq!(interpreter.finish_run(InstrStop::Stop), Ok(InstrStop::Stop));
+    }
+
+    #[test]
+    fn custom_host_binds_each_parent_callback() {
+        fn inspect(host: &mut TestHost, parent: &mut Interpreter<'_, '_, TestTypes>) {
+            // execute_message already mutated the host by recording its call.
+            assert_eq!(host.calls.len(), 1);
+            parent.with_host(host, |parent| {
+                parent.host().tstore(&Address::ZERO, &Word::ZERO, &Word::from(123));
+                assert_eq!(parent.host().tload(&Address::ZERO, &Word::ZERO), Word::from(123));
+                parent.stack_mut().push(Word::from(99)).unwrap();
+            });
+            assert!(!parent.host_bound);
+            host.tstore(&Address::ZERO, &Word::ZERO, &Word::from(456));
+            parent.with_host(host, |parent| {
+                assert_eq!(parent.host().tload(&Address::ZERO, &Word::ZERO), Word::from(456));
+            });
+            assert!(!parent.host_bound);
+        }
+
+        struct Hooks(OpcodeSet);
+        impl Inspector<TestTypes> for Hooks {
+            fn inspected_opcodes(&self) -> OpcodeSet {
+                self.0
+            }
+        }
+        for opcodes in [OpcodeSet::EMPTY, OpcodeSet::ALL] {
+            let tx = TxEnvExt::default();
+            let message = parent_call_message();
+            let mut parent = Interpreter::<TestTypes>::new(&tx, &message);
+            let config = ExecutionConfig::for_config::<BaseEvmConfig<{ SpecId::OSAKA as u32 }>>();
+            let mut host = TestHost {
+                message_hook: Some(inspect),
+                execute_result: MessageResultExt {
+                    gas: GasTracker::new(1000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(
+                parent.run_inspect(&config, &mut host, &mut Hooks(opcodes)),
+                Ok(InstrStop::Stop)
+            );
+            assert_eq!(parent.stack().as_slice(), &[Word::from(99), Word::from(1)]);
+            assert_eq!(parent.gas().remaining(), 99_879);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "suspended host access requires Interpreter::with_host")]
+    fn custom_host_cannot_access_stale_parent_host() {
+        fn inspect(host: &mut TestHost, parent: &mut Interpreter<'_, '_, TestTypes>) {
+            host.tstore(&Address::ZERO, &Word::ZERO, &Word::from(456));
+            parent.host().tload(&Address::ZERO, &Word::ZERO);
+        }
+        let tx = TxEnvExt::default();
+        let message = parent_call_message();
+        let mut parent = Interpreter::<TestTypes>::new(&tx, &message);
+        let config = ExecutionConfig::for_config::<BaseEvmConfig<{ SpecId::OSAKA as u32 }>>();
+        let mut host = TestHost { message_hook: Some(inspect), ..Default::default() };
+        parent.run_inspect(&config, &mut host, &mut crate::NoopInspector::default()).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn host_binding_is_revoked_on_unwind() {
+        let tx = TxEnvExt::default();
+        let message = MessageExt::default();
+        let mut parent = Interpreter::<TestTypes>::new(&tx, &message);
+        let mut host = TestHost::default();
+        parent.prepare_run(SpecId::OSAKA, Version::base(SpecId::OSAKA), &mut host);
+        parent.suspend_host();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parent.with_host(&mut host, |parent| {
+                parent.host().tstore(&Address::ZERO, &Word::ZERO, &Word::from(123));
+                panic!("callback failed");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(!parent.host_bound);
+        host.tstore(&Address::ZERO, &Word::ZERO, &Word::from(456));
+        parent.with_host(&mut host, |parent| {
+            assert_eq!(parent.host().tload(&Address::ZERO, &Word::ZERO), Word::from(456));
+        });
+        assert!(!parent.host_bound);
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn message_unwind_clears_parent_host_identity() {
+        fn inspect(_host: &mut TestHost, _parent: &mut Interpreter<'_, '_, TestTypes>) {
+            panic!("message failed");
+        }
+        let tx = TxEnvExt::default();
+        let message = parent_call_message();
+        let mut parent = Interpreter::<TestTypes>::new(&tx, &message);
+        let config = ExecutionConfig::for_config::<BaseEvmConfig<{ SpecId::OSAKA as u32 }>>();
+        let mut host = TestHost { message_hook: Some(inspect), ..Default::default() };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parent.run_inspect(&config, &mut host, &mut crate::NoopInspector::default()).unwrap();
+        }));
+        assert!(result.is_err());
+        assert!(!parent.host_bound);
+        assert!(parent.host.is_none());
+        assert!(parent.host_type_id.is_none());
+    }
+
+    fn parent_call_message() -> Message<TestTypes> {
+        let mut code = [op::PUSH1, 0].repeat(5);
+        code.extend([op::PUSH1, 0x22, op::PUSH2, 3, 0xe8, op::CALL, op::STOP]);
+        MessageExt {
+            gas_limit: 100_000,
+            code: Bytecode::new_legacy(code.into()),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive_where(Debug)]
+struct PendingMessage<T: EvmTypesHost> {
+    message: Message<T>,
+    completion: MessageCompletion,
+}
+
+#[derive(Debug)]
+pub(crate) enum MessageCompletion {
+    Call { output: Range<usize>, new_account_state_gas: u64 },
+    Create { new_account_state_gas: u64 },
+}
+
+fn complete_message<T: EvmTypesHost>(
+    mut stack: StackMut<'_>,
+    gas: &mut Gas,
+    memory: &mut Memory,
+    return_data: &mut Bytes,
+    completion: MessageCompletion,
+    mut result: MessageResult<T>,
+) -> Result {
+    if result.stop.is_fatal() {
+        return Err(result.stop);
+    }
+    gas.merge_child_gas(result.gas, result.stop);
+    match completion {
+        MessageCompletion::Call { output, new_account_state_gas } => {
+            // Refund the upfront account-creation charge if the value-bearing CALL failed.
+            if new_account_state_gas != 0 && !result.stop.is_success() {
+                gas.refill_reservoir(new_account_state_gas);
+            }
+            let copy_len = min(output.len(), result.output.len());
+            if copy_len != 0 {
+                // Hooks can change memory, so reacquire and resize it before copying the output.
+                memory.resize(output.start, copy_len)?;
+                unsafe {
+                    memory.set_unchecked(output.start, result.output.get_unchecked(..copy_len));
+                }
+            }
+            core::mem::swap(return_data, &mut result.output);
+            stack.push(Word::from(result.stop.is_success()))
+        }
+        MessageCompletion::Create { new_account_state_gas } => {
+            // CREATE failures leave no new account and refund its conditional state charge.
+            if new_account_state_gas != 0
+                && (result.created_address.is_none() || !result.stop.is_success())
+            {
+                gas.refill_reservoir(new_account_state_gas);
+            }
+            // EIP-211 exposes only CREATE revert data.
+            if result.stop == InstrStop::Revert {
+                core::mem::swap(return_data, &mut result.output);
+            } else {
+                return_data.clear();
+            }
+            stack.push(result.created_address_for_parent())
+        }
+    }
+}
+
+struct HostBinding<'a, 'frame, 'host, T: EvmTypesHost> {
+    interpreter: &'a mut Interpreter<'frame, 'host, T>,
+}
+
+impl<T: EvmTypesHost> Drop for HostBinding<'_, '_, '_, T> {
+    fn drop(&mut self) {
+        self.interpreter.suspend_host();
+    }
+}
+
+struct SuspendedHost<'a, 'frame, 'host, T: EvmTypesHost> {
+    interpreter: &'a mut Interpreter<'frame, 'host, T>,
+}
+
+impl<T: EvmTypesHost> Drop for SuspendedHost<'_, '_, '_, T> {
+    fn drop(&mut self) {
+        self.interpreter.host = None;
+        self.interpreter.host_type_id = None;
+        self.interpreter.suspend_host();
     }
 }

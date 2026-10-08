@@ -717,7 +717,7 @@ pub fn execute_initial_frame<T: EvmTypes>(
 
     // Failed execution has already been rolled back to the message's own checkpoint inside
     // `execute_message`; the settle merges the frame gas into the transaction-level gas.
-    let mut result = host.execute_message(tx_env, &mut message)?;
+    let mut result = host.execute_message(tx_env, &mut message, None)?;
     settle_initial_frame_gas(tx_gas, &mut result, charged_state_gas);
     Ok(result)
 }
@@ -1342,7 +1342,8 @@ mod tests {
         assert!(message.disable_precompiles);
         assert_eq!(charged_state_gas, 0);
 
-        let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
+        let result =
+            Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message, None).unwrap();
 
         assert_eq!(result.stop, InstrStop::Return);
         assert_eq!(result.output.len(), 32);

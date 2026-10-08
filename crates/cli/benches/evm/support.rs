@@ -1,13 +1,14 @@
 use crate::fixture::Suites;
 use criterion::{BatchSize, BenchmarkGroup, black_box, measurement::WallTime};
 use evm2::{
-    BaseEvmTypes, Evm, Precompiles, SpecId,
+    BaseEvmTypes, Evm, Inspector, Precompiles, SpecId,
     env::BlockEnv,
     ethereum::{RecoveredTxEnvelope, ethereum_tx_registry},
     evm::InMemoryDB,
+    interpreter::{Interpreter, Message, MessageResult, OpcodeSet},
 };
 use evm2_cli::evm_bench::BenchCase;
-use std::borrow::Cow;
+use std::{borrow::Cow, env};
 
 type BenchEvm = Evm<'static, BaseEvmTypes>;
 
@@ -63,10 +64,20 @@ struct Runner {
 
 impl Runner {
     fn new(prepared: &PreparedBench) -> Self {
-        Self {
-            evm: new_evm(prepared.spec, prepared.block, prepared.db.clone()),
-            tx: prepared.tx.clone(),
+        let mut evm = new_evm(prepared.spec, prepared.block, prepared.db.clone());
+        match env::var("EVM2_BENCH_INSPECTOR").as_deref() {
+            Ok("full") => {
+                evm.set_inspector(CallOnlyInspector { opcodes: OpcodeSet::ALL, calls: 0 })
+            }
+            Ok("empty") => {
+                evm.set_inspector(CallOnlyInspector { opcodes: OpcodeSet::EMPTY, calls: 0 })
+            }
+            Ok("none") | Err(_) => {}
+            Ok(value) => {
+                panic!("unknown EVM2_BENCH_INSPECTOR: {value}; expected none, full, or empty")
+            }
         }
+        Self { evm, tx: prepared.tx.clone() }
     }
 
     fn run(&mut self) -> evm2::registry::HandlerResult<evm2::TxResult> {
@@ -76,4 +87,25 @@ impl Runner {
 
 fn new_evm(spec: SpecId, block: BlockEnv, db: InMemoryDB) -> BenchEvm {
     Evm::new(spec, block, ethereum_tx_registry(spec), db, Precompiles::base(spec))
+}
+
+// Opt in with EVM2_BENCH_INSPECTOR=full or empty to measure a call-only inspector.
+struct CallOnlyInspector {
+    opcodes: OpcodeSet,
+    calls: usize,
+}
+
+impl Inspector<BaseEvmTypes> for CallOnlyInspector {
+    fn call(
+        &mut self,
+        _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+        _message: &mut Message<BaseEvmTypes>,
+    ) -> Option<MessageResult<BaseEvmTypes>> {
+        self.calls += 1;
+        None
+    }
+
+    fn inspected_opcodes(&self) -> OpcodeSet {
+        self.opcodes
+    }
 }

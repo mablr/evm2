@@ -60,6 +60,11 @@ fn analyze_simd(code: &[u8], table: &mut [u8]) -> usize {
         return 0;
     }
     core::cfg_select! {
+        // Miri cannot execute the SIMD intrinsics used by these kernels.
+        miri => {
+            let _ = table;
+            0
+        }
         any(target_arch = "x86", target_arch = "x86_64") => x86::analyze(code, table),
         target_arch = "aarch64" => aarch64::analyze(code, table),
         _ => {

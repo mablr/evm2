@@ -1,8 +1,8 @@
-use super::{GasTracker, InstrStop, Message, Result, Word};
+use super::{GasTracker, InstrStop, Interpreter, Message, Result, Word};
 use crate::{
     BaseEvmTypes, DatabaseError, EvmFeatures, EvmTypesHost, ExecutionError, HostError, SpecId,
     env::{BlockEnv, TxEnv},
-    evm::{AccountLoad, SLoad, SStore, SelfDestructResult},
+    evm::{AccountLoad, NonStaticAny, SLoad, SStore, SelfDestructResult},
 };
 use alloy_primitives::{Address, B256, Bytes, Log};
 
@@ -109,7 +109,7 @@ impl<E> MessageResultExt<E> {
 }
 
 /// External host operations.
-pub trait Host<T: EvmTypesHost> {
+pub trait Host<T: EvmTypesHost>: NonStaticAny {
     /// Returns the active base specification ID.
     fn spec_id(&self) -> SpecId;
 
@@ -161,10 +161,17 @@ pub trait Host<T: EvmTypesHost> {
     fn log(&mut self, log: Log);
 
     /// Executes a message inside this host.
+    ///
+    /// CALL/CREATE instructions provide their suspended parent for inspection, after dispatch
+    /// has released its gas and stack borrows. The parent must be prepared against this host.
+    /// Its host access is suspended: invoke callbacks inside [`Interpreter::with_host`] so
+    /// direct host operations cannot invalidate their retained host pointer.
+    /// Top-level and precompile messages pass `None`.
     fn execute_message(
         &mut self,
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
+        parent: Option<&mut Interpreter<'_, '_, T>>,
     ) -> Result<MessageResult<T>, ExecutionError>;
 
     /// Registers the current contract for self-destruction.

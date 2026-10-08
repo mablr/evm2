@@ -8,6 +8,8 @@ pub(crate) type InstructionImplFn<T> =
 /// EVM instruction implementation.
 pub trait Instruction<T: EvmTypesHost = crate::BaseEvmTypes> {
     /// Whether this instruction needs mutable gas state.
+    ///
+    /// Message-producing implementations must enable this for gas synchronization and suspension.
     const DYNAMIC_GAS: bool = true;
 
     /// Executes this instruction.

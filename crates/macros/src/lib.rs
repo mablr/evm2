@@ -39,6 +39,8 @@ use syn::{
 ///   checks.
 /// - `#[instruction(dynamic_gas)]`: Exposes `cx.gas` and marks the instruction as needing access to
 ///   mutable gas state.
+/// - `#[instruction(dynamic_gas, no_gas_preamble)]`: Marks dynamic gas access without creating
+///   `cx.gas`. The instruction accesses gas through `cx.state` instead.
 /// - `#[instruction(EvmTypes = CustomTypes)]`: Implements the instruction for a concrete EVM type
 ///   family instead of generating a generic implementation.
 /// - `#[instruction(EvmTypes: CustomTypesTrait)]`: Adds a trait bound to the generated generic EVM
@@ -140,6 +142,7 @@ impl Parse for InstructionAttr {
 struct InstructionAttrs {
     no_stack_preamble: bool,
     dynamic_gas: bool,
+    no_gas_preamble: bool,
     evm_types: Option<Type>,
     evm_types_span: Option<proc_macro2::Span>,
     evm_types_bounds: Vec<Punctuated<TypeParamBound, Token![+]>>,
@@ -156,6 +159,9 @@ impl InstructionAttrs {
                 }
                 InstructionAttr::Flag(arg) if arg == "dynamic_gas" => {
                     attrs.dynamic_gas = true;
+                }
+                InstructionAttr::Flag(arg) if arg == "no_gas_preamble" => {
+                    attrs.no_gas_preamble = true;
                 }
                 InstructionAttr::Flag(arg) => {
                     return Err(syn::Error::new_spanned(
@@ -272,7 +278,7 @@ fn expand_instruction(instruction_attrs: InstructionAttrs, input: ItemFn) -> Tok
     };
     let cx_setup = has_cx.then(|| {
         let cx = cx_arg.unwrap_or_else(|| Ident::new("cx", ident.span()));
-        if instruction_attrs.dynamic_gas {
+        if instruction_attrs.dynamic_gas && !instruction_attrs.no_gas_preamble {
             quote! {
                 let (__evm2_gas, __evm2_state) = unsafe {
                     evm2::interpreter::private::split_gas_state(__evm2_state)

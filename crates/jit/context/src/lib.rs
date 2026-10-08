@@ -862,12 +862,12 @@ mod tests {
             NoPrecompiles::default(),
         );
         host.set_interpreter_runner(TestRunner(EvmCompilerFn::new(fail)));
-        let error = host.execute_message(&tx, &mut message).unwrap_err();
+        let error = host.execute_message(&tx, &mut message, None).unwrap_err();
         let ExecutionError::Database(error) = error else { panic!("expected database error") };
         assert!(!error.is_fatal());
         assert!(error.downcast_ref::<core::fmt::Error>().is_some());
         host.set_interpreter_runner(TestRunner(EvmCompilerFn::new(__test_fn)));
-        assert_eq!(host.execute_message(&tx, &mut message).unwrap().stop, InstrStop::Stop);
+        assert_eq!(host.execute_message(&tx, &mut message, None).unwrap().stop, InstrStop::Stop);
     }
 
     #[test]

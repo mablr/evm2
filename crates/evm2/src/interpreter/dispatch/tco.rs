@@ -30,13 +30,14 @@ pub(super) type RawInstrTable<T> = TailInstrTable<T>;
 pub(in crate::interpreter) fn run<T: EvmTypesHost>(
     interpreter: &mut Interpreter<'_, '_, T>,
     instructions: &RawInstrTable<T>,
-) -> InstrStop {
+    _step_opcodes: bool,
+) -> Option<InstrStop> {
     let remaining_gas = RemainingGas::new(interpreter.gas.remaining());
     let (state, pc, stack) = run_state(interpreter);
     let op = pc.op();
     let instr = instructions[op as usize];
     instr(pc, stack, remaining_gas, state, (instructions as *const RawInstrTable<T>).cast());
-    state.result().unwrap_err()
+    state.result().err()
 }
 
 extern_table! {
@@ -86,6 +87,10 @@ extern_table! {
         if dynamic_gas {
             remaining_gas.set(state.gas_mut().remaining());
         }
+        // Only instructions accessing mutable gas can prepare messages.
+        if dynamic_gas && state.has_pending_message() {
+            tail_return!(tail_call_restore(pc, stack, remaining_gas, state, instructions));
+        }
         if let Err(e) = r {
             cold_path();
             state.set_result(Err(e));
@@ -123,7 +128,7 @@ extern_table! {
     ) {
         state.gas_mut().set_remaining(remaining_gas.get());
         state.set_pc_stack_len(pc.as_ptr(), stack.len());
-        debug_assert!(state.result().is_err());
+        debug_assert!(state.result().is_err() || state.has_pending_message());
         // Exits by returning normally.
     }
 }

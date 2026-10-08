@@ -636,6 +636,45 @@ opcodes! {
     0xFF => SELFDESTRUCT => selfdestruct => stack_io(1, 0), terminating;
 }
 
+/// A set of raw opcode bytes, including undefined opcodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct OpcodeSet([u64; 4]);
+
+impl OpcodeSet {
+    /// No opcodes.
+    pub const EMPTY: Self = Self([0; 4]);
+
+    /// Every opcode byte.
+    pub const ALL: Self = Self([u64::MAX; 4]);
+
+    /// Adds an opcode byte to the set.
+    #[inline]
+    pub const fn insert(&mut self, opcode: u8) {
+        self.0[opcode as usize / 64] |= 1 << (opcode % 64);
+    }
+
+    /// Returns whether the set contains an opcode byte.
+    #[inline]
+    pub const fn contains(&self, opcode: u8) -> bool {
+        self.0[opcode as usize / 64] & (1 << (opcode % 64)) != 0
+    }
+
+    /// Returns whether the set contains no opcode bytes.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.0[0] == 0 && self.0[1] == 0 && self.0[2] == 0 && self.0[3] == 0
+    }
+
+    /// Returns whether the set contains every opcode byte.
+    #[inline]
+    pub const fn is_full(&self) -> bool {
+        self.0[0] == u64::MAX
+            && self.0[1] == u64::MAX
+            && self.0[2] == u64::MAX
+            && self.0[3] == u64::MAX
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,5 +688,22 @@ mod tests {
         assert!(OpCode::RETURN.info().is_terminating());
         assert!(!OpCode::ADD.info().is_terminating());
         assert_eq!(OpCode::new_or_unknown(0x0C).info().name(), "UNKNOWN");
+    }
+
+    #[test]
+    fn all_opcode_bytes() {
+        assert_eq!(core::mem::size_of::<OpcodeSet>(), 32);
+        assert!(OpcodeSet::EMPTY.is_empty());
+        assert!(OpcodeSet::ALL.is_full());
+        let mut set = OpcodeSet::EMPTY;
+        for opcode in 0..=u8::MAX {
+            assert!(!set.contains(opcode));
+            set.insert(opcode);
+            set.insert(opcode);
+            assert!(set.contains(opcode));
+            assert!(!set.is_empty());
+            assert_eq!(set.is_full(), opcode == u8::MAX);
+        }
+        assert_eq!(set, OpcodeSet::ALL);
     }
 }

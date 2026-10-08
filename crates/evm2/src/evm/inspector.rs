@@ -3,7 +3,7 @@
 use crate::{
     EvmTypesHost,
     evm::NonStaticAny,
-    interpreter::{Interpreter, Message, MessageResult},
+    interpreter::{Interpreter, Message, MessageResult, OpcodeSet},
 };
 use alloc::boxed::Box;
 use alloy_primitives::{Address, Log, U256};
@@ -109,6 +109,19 @@ pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
         let _ = value;
         let _ = host;
     }
+
+    /// Opcodes whose `step`/`step_end` hooks this inspector needs. Read when each frame starts.
+    ///
+    /// An empty set uses the normal interpreter table and loop, including an installed
+    /// [`InterpreterRunner`](crate::InterpreterRunner). Frame, message, log, and self-destruct
+    /// hooks remain enabled. Changes during a frame affect only frames started afterwards.
+    ///
+    /// Currently every nonempty set, including sparse sets, steps all opcodes on every backend.
+    /// The default preserves full per-instruction inspection.
+    #[inline]
+    fn inspected_opcodes(&self) -> OpcodeSet {
+        OpcodeSet::ALL
+    }
 }
 
 #[inline]
@@ -143,10 +156,10 @@ impl<'a, T: EvmTypesHost> core::ops::DerefMut for dyn Inspector<T> + 'a {
 
 #[cfg(test)]
 mod tests {
-    use super::Inspector;
+    use super::*;
     use crate::{
         BaseEvmConfigSelector, BaseEvmTypes, DatabaseError, Evm, EvmConfig, EvmTypesHost,
-        ExecutionConfig, OpcodeConfig, Precompiles, SpecId,
+        ExecutionConfig, ExecutionError, InterpreterRunner, OpcodeConfig, Precompiles, SpecId,
         bytecode::Bytecode,
         constants::CALL_DEPTH_LIMIT,
         env::{BlockEnvExt, TxEnvExt},
@@ -160,10 +173,13 @@ mod tests {
         test_utils::{TestHost, TestTypes, legacy_bytecode, push, push_all},
         utils::address_to_word,
     };
-    use alloc::{boxed::Box, vec, vec::Vec};
+    use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
     use alloy_consensus::{TxLegacy, transaction::Recovered};
     use alloy_primitives::{Address, Bytes, Log, TxKind, U256};
-    use core::assert_matches;
+    use core::{
+        assert_matches,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     #[derive(Default)]
     struct SelfdestructInspector {
@@ -314,11 +330,18 @@ mod tests {
         logs: Vec<Log>,
         calls: usize,
         creates: usize,
+        call_ends: usize,
+        create_ends: usize,
+        selfdestruct: Option<(Address, Address, Word)>,
     }
 
     #[derive(Default)]
     struct SharedE2eInspector {
         state: E2eState,
+        opcodes: Option<OpcodeSet>,
+        switch_on_call: bool,
+        depth_steps: [usize; 2],
+        depth_ends: [usize; 2],
     }
 
     impl Inspector<BaseEvmTypes> for SharedE2eInspector {
@@ -326,12 +349,18 @@ mod tests {
             self.state.initialized += 1;
         }
 
-        fn step(&mut self, _interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+        fn step(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
             self.state.steps += 1;
+            if self.switch_on_call {
+                self.depth_steps[interp.message().depth as usize] += 1;
+            }
         }
 
-        fn step_end(&mut self, _interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+        fn step_end(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
             self.state.step_ends += 1;
+            if self.switch_on_call {
+                self.depth_ends[interp.message().depth as usize] += 1;
+            }
         }
 
         fn log(&mut self, log: &Log, _host: &mut Evm<'_, BaseEvmTypes>) {
@@ -341,9 +370,16 @@ mod tests {
         fn call(
             &mut self,
             _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
-            _message: &mut Message<BaseEvmTypes>,
+            message: &mut Message<BaseEvmTypes>,
         ) -> Option<MessageResult<BaseEvmTypes>> {
             self.state.calls += 1;
+            if self.switch_on_call && message.depth == 1 {
+                self.opcodes = Some(if self.inspected_opcodes().is_empty() {
+                    OpcodeSet::ALL
+                } else {
+                    OpcodeSet::EMPTY
+                });
+            }
             None
         }
 
@@ -354,6 +390,53 @@ mod tests {
         ) -> Option<MessageResult<BaseEvmTypes>> {
             self.state.creates += 1;
             None
+        }
+
+        fn call_end(
+            &mut self,
+            _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+            _message: &Message<BaseEvmTypes>,
+            _result: &mut MessageResult<BaseEvmTypes>,
+        ) {
+            self.state.call_ends += 1;
+        }
+
+        fn create_end(
+            &mut self,
+            _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+            _message: &Message<BaseEvmTypes>,
+            _result: &mut MessageResult<BaseEvmTypes>,
+        ) {
+            self.state.create_ends += 1;
+        }
+
+        fn selfdestruct(
+            &mut self,
+            contract: &Address,
+            target: &Address,
+            value: &Word,
+            _host: &mut Evm<'_, BaseEvmTypes>,
+        ) {
+            self.state.selfdestruct = Some((*contract, *target, *value));
+        }
+
+        fn inspected_opcodes(&self) -> OpcodeSet {
+            self.opcodes.unwrap_or(OpcodeSet::ALL)
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingRunner(Arc<AtomicUsize>);
+
+    impl InterpreterRunner<BaseEvmTypes> for CountingRunner {
+        fn run<'frame, 'host>(
+            &self,
+            config: &ExecutionConfig<BaseEvmTypes>,
+            interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
+            host: &mut Evm<'host, BaseEvmTypes>,
+        ) -> Option<InstrStop> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Some(interpreter.run(config, host).unwrap())
         }
     }
 
@@ -1212,41 +1295,79 @@ mod tests {
             op::LOG0,
             op::STOP,
         ]));
-        let mut database = InMemoryDB::default();
-        database.insert_account_info(
-            &caller,
-            AccountInfo::default().with_balance(U256::from(1_000_000_000_u64)),
-        );
-        database.insert_account_info(&contract, AccountInfo::default().with_code(code));
-        let mut evm = Evm::<BaseEvmTypes>::new(
-            SpecId::OSAKA,
-            BlockEnvExt::default(),
-            ethereum_tx_registry(SpecId::OSAKA),
-            database,
-            Precompiles::base(SpecId::OSAKA),
-        );
-        evm.set_inspector(SharedE2eInspector::default());
-        let tx = Recovered::new_unchecked(
-            TxEnvelope::Legacy(TxLegacy {
-                to: TxKind::Call(contract),
-                gas_limit: 100_000,
-                ..Default::default()
-            }),
-            caller,
-        );
+        for opcodes in [OpcodeSet::ALL, OpcodeSet::EMPTY] {
+            let mut database = InMemoryDB::default();
+            database.insert_account_info(
+                &caller,
+                AccountInfo::default().with_balance(U256::from(1_000_000_000_u64)),
+            );
+            database.insert_account_info(&contract, AccountInfo::default().with_code(code.clone()));
+            let mut evm = Evm::<BaseEvmTypes>::new(
+                SpecId::OSAKA,
+                BlockEnvExt::default(),
+                ethereum_tx_registry(SpecId::OSAKA),
+                database,
+                Precompiles::base(SpecId::OSAKA),
+            );
+            evm.set_inspector(SharedE2eInspector { opcodes: Some(opcodes), ..Default::default() });
+            let tx = Recovered::new_unchecked(
+                TxEnvelope::Legacy(TxLegacy {
+                    to: TxKind::Call(contract),
+                    gas_limit: 100_000,
+                    ..Default::default()
+                }),
+                caller,
+            );
 
-        let result = evm.transact(&tx).expect("transaction should execute").discard();
-        let inspector = evm.inspector().unwrap().downcast_ref::<SharedE2eInspector>().unwrap();
-        let state = &inspector.state;
+            let result = evm.transact(&tx).expect("transaction should execute").discard();
+            let inspector = evm.inspector().unwrap().downcast_ref::<SharedE2eInspector>().unwrap();
+            let state = &inspector.state;
 
-        assert!(result.status);
-        assert_eq!(state.initialized, 1);
-        assert_eq!(state.steps, 4);
-        assert_eq!(state.step_ends, 4);
-        assert_eq!(state.logs.len(), 1);
-        assert_eq!(state.logs[0].address, contract);
-        assert_eq!(state.calls, 1);
-        assert_eq!(state.creates, 0);
+            assert!(result.status);
+            assert_eq!(state.initialized, 1);
+            assert_eq!(state.steps, if opcodes.is_empty() { 0 } else { 4 });
+            assert_eq!(state.step_ends, state.steps);
+            assert_eq!(state.logs.len(), 1);
+            assert_eq!(state.logs[0].address, contract);
+            assert_eq!(state.calls, 1);
+            assert_eq!(state.creates, 0);
+        }
+    }
+
+    #[test]
+    fn empty_inspected_opcodes_uses_interpreter_runner() {
+        for step_opcodes in [None, Some(false), Some(true)] {
+            let runs = Arc::new(AtomicUsize::new(0));
+            let mut evm = Evm::<BaseEvmTypes>::new(
+                SpecId::OSAKA,
+                BlockEnvExt::default(),
+                TxRegistry::new(),
+                InMemoryDB::default(),
+                Precompiles::base(SpecId::OSAKA),
+            );
+            if let Some(step_opcodes) = step_opcodes {
+                evm.set_inspector(SharedE2eInspector {
+                    opcodes: Some(if step_opcodes { OpcodeSet::ALL } else { OpcodeSet::EMPTY }),
+                    ..Default::default()
+                });
+            }
+            evm.set_interpreter_runner(CountingRunner(runs.clone()));
+            let mut message = MessageExt {
+                gas_limit: 10_000,
+                code: legacy_bytecode([op::PUSH1, 0x33, op::SELFDESTRUCT]),
+                ..MessageExt::default()
+            };
+
+            let result =
+                Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message, None).unwrap();
+
+            assert_eq!(result.stop, InstrStop::SelfDestruct);
+            assert_eq!(result.gas.remaining(), 2397);
+            if let Some(inspector) = evm.clear_inspector_as::<SharedE2eInspector>() {
+                assert!(inspector.state.selfdestruct.is_some());
+            }
+            assert_eq!(runs.load(Ordering::Relaxed), usize::from(step_opcodes != Some(true)));
+        }
     }
 
     #[test]
@@ -1649,46 +1770,220 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_frame_keeps_message_snapshot_during_hook_mutation() {
-        struct SnapshotInspector;
+    fn empty_inspected_opcodes_preserves_successful_selfdestruct_notifications() {
+        let contract = Address::from([0x11; 20]);
+        let target = Address::from([0x99; 20]);
+        let value = Word::from(0xbeef);
+        for step_opcodes in [false, true] {
+            for gas_limit in [7_000, 50_000] {
+                let mut db = InMemoryDB::default();
+                db.insert_account_info(&contract, AccountInfo::default().with_balance(value));
+                let mut code = Vec::new();
+                push(&mut code, address_to_word(&target));
+                code.push(op::SELFDESTRUCT);
+                let (result, inspector, _) = run_evm_with_inspector_db(
+                    db,
+                    code,
+                    &MessageExt { destination: contract, ..Default::default() },
+                    gas_limit,
+                    SharedE2eInspector {
+                        opcodes: Some(if step_opcodes { OpcodeSet::ALL } else { OpcodeSet::EMPTY }),
+                        ..Default::default()
+                    },
+                );
 
-        impl Inspector<BaseEvmTypes> for SnapshotInspector {
-            fn call(
-                &mut self,
-                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
-                message: &mut Message<BaseEvmTypes>,
-            ) -> Option<MessageResult<BaseEvmTypes>> {
-                assert_eq!(interp.message().input, Bytes::from_static(b"before"));
-                message.input = Bytes::from_static(b"after");
-                assert_eq!(interp.message().input, Bytes::from_static(b"before"));
-                Some(MessageResultExt {
-                    stop: InstrStop::Return,
-                    gas: GasTracker::new(message.gas_limit),
+                if gas_limit == 7_000 {
+                    assert_eq!(result.stop, InstrStop::OutOfGas);
+                    assert_eq!(inspector.state.selfdestruct, None);
+                } else {
+                    assert_eq!(result.stop, InstrStop::SelfDestruct);
+                    assert_eq!(inspector.state.selfdestruct, Some((contract, target, value)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inspected_opcodes_preserve_all_retained_hooks_and_gas() {
+        let outer = Address::from([0x11; 20]);
+        let inner = Address::from([0x22; 20]);
+        let target = Address::from([0x33; 20]);
+        let mut inner_code = vec![op::PUSH0, op::PUSH0, op::LOG0];
+        push(&mut inner_code, address_to_word(&target));
+        inner_code.push(op::SELFDESTRUCT);
+        let mut code = Vec::new();
+        push_all(
+            &mut code,
+            [
+                Word::ZERO,
+                Word::ZERO,
+                Word::ZERO,
+                Word::ZERO,
+                Word::ZERO,
+                address_to_word(&inner),
+                Word::from(50_000),
+            ],
+        );
+        code.push(op::CALL);
+        push(&mut code, Word::from_be_slice(&[op::PUSH0, op::PUSH0, op::RETURN]));
+        code.extend([
+            op::PUSH0,
+            op::MSTORE,
+            op::PUSH1,
+            3,
+            op::PUSH1,
+            29,
+            op::PUSH0,
+            op::CREATE,
+            op::GAS,
+        ]);
+        return_top_word(&mut code);
+        let mut sparse = OpcodeSet::EMPTY;
+        sparse.insert(op::SLOAD);
+        sparse.insert(op::SSTORE);
+        let mut reference = None;
+        let mut reference_steps = None;
+        for opcodes in [OpcodeSet::ALL, OpcodeSet::EMPTY, sparse] {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(&outer, AccountInfo::default());
+            db.insert_account_info(
+                &inner,
+                AccountInfo::default().with_code(legacy_bytecode(inner_code.clone())),
+            );
+            let (result, inspector, _) = run_evm_with_inspector_db(
+                db,
+                code.clone(),
+                &MessageExt { destination: outer, ..Default::default() },
+                200_000,
+                SharedE2eInspector { opcodes: Some(opcodes), ..Default::default() },
+            );
+            assert_eq!(result.stop, InstrStop::Return);
+            let state = &inspector.state;
+            assert_eq!((state.initialized, state.calls, state.call_ends), (3, 2, 2));
+            assert_eq!((state.creates, state.create_ends, state.logs.len()), (1, 1, 1));
+            assert_eq!(state.logs[0].address, inner);
+            assert_eq!(state.selfdestruct, Some((inner, target, Word::ZERO)));
+            assert_eq!(state.steps, state.step_ends);
+            if opcodes.is_empty() {
+                assert_eq!(state.steps, 0);
+            } else if let Some(steps) = reference_steps {
+                assert_eq!(state.steps, steps);
+            } else {
+                assert!(state.steps > 0);
+                reference_steps = Some(state.steps);
+            }
+            let observed = (result.stop, result.gas, result.output);
+            if let Some(reference) = &reference {
+                assert_eq!(&observed, reference);
+            } else {
+                reference = Some(observed);
+            }
+        }
+    }
+
+    #[test]
+    fn inspected_opcodes_switch_only_for_subsequent_frames() {
+        let target = Address::from([0x22; 20]);
+        let mut code = call_code(target);
+        code.extend([op::CALL, op::STOP]);
+        let mut reference = None;
+        for stepping in [false, true] {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                &target,
+                AccountInfo::default().with_code(legacy_bytecode(vec![
+                    op::PUSH0,
+                    op::POP,
+                    op::STOP,
+                ])),
+            );
+            let (result, inspector, _) = run_evm_with_inspector_db(
+                db,
+                code.clone(),
+                &MessageExt::default(),
+                100_000,
+                SharedE2eInspector {
+                    opcodes: Some(if stepping { OpcodeSet::ALL } else { OpcodeSet::EMPTY }),
+                    switch_on_call: true,
                     ..Default::default()
-                })
+                },
+            );
+            assert_eq!(result.stop, InstrStop::Stop);
+            assert_eq!(inspector.depth_steps, if stepping { [9, 0] } else { [0, 3] });
+            assert_eq!(inspector.depth_steps, inspector.depth_ends);
+            if let Some(gas) = reference {
+                assert_eq!(result.gas, gas);
+            } else {
+                reference = Some(result.gas);
+            }
+        }
+    }
+
+    #[test]
+    fn inspected_opcodes_initialization_stops_and_errors_bypass_runner() {
+        struct InitializingInspector(OpcodeSet, Result<InstrStop, ExecutionError>);
+
+        impl Inspector<BaseEvmTypes> for InitializingInspector {
+            fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                match &self.1 {
+                    Ok(stop) => interp.set_stop(*stop),
+                    Err(error) => {
+                        interp.fail(error.clone());
+                    }
+                }
             }
 
-            fn call_end(
-                &mut self,
-                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
-                message: &Message<BaseEvmTypes>,
-                _result: &mut MessageResult<BaseEvmTypes>,
-            ) {
-                assert_eq!(interp.message().input, Bytes::from_static(b"before"));
-                assert_eq!(message.input, Bytes::from_static(b"after"));
+            fn inspected_opcodes(&self) -> OpcodeSet {
+                self.0
             }
         }
 
-        let _ = run_evm_with_inspector(
-            vec![op::STOP],
-            &MessageExt { input: Bytes::from_static(b"before"), ..Default::default() },
-            100_000,
-            SnapshotInspector,
-        );
+        let error = ExecutionError::Fatal("initialization failed".into());
+        for opcodes in [OpcodeSet::EMPTY, OpcodeSet::ALL] {
+            for initialization in [
+                Ok(InstrStop::Stop),
+                Ok(InstrStop::Return),
+                Ok(InstrStop::Revert),
+                Err(error.clone()),
+            ] {
+                let mut evm = Evm::<BaseEvmTypes>::new(
+                    SpecId::OSAKA,
+                    BlockEnvExt::default(),
+                    TxRegistry::new(),
+                    InMemoryDB::default(),
+                    Precompiles::base(SpecId::OSAKA),
+                );
+                evm.set_inspector(InitializingInspector(opcodes, initialization.clone()));
+                let invocations = Arc::new(AtomicUsize::new(0));
+                evm.set_interpreter_runner(CountingRunner(invocations.clone()));
+                let mut message = MessageExt {
+                    gas_limit: 50_000,
+                    code: legacy_bytecode([op::PUSH1, 42, op::PUSH0, op::SSTORE, op::STOP]),
+                    ..Default::default()
+                };
+                let result =
+                    Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message, None);
+                match initialization {
+                    Ok(stop) => {
+                        let result = result.unwrap();
+                        assert_eq!(result.stop, stop);
+                        assert_eq!(result.gas.remaining(), message.gas_limit);
+                        assert_eq!(
+                            evm.state().get_storage(&message.destination, &Word::ZERO),
+                            None
+                        );
+                    }
+                    Err(error) => assert_eq!(result.unwrap_err(), error),
+                }
+                assert_eq!(invocations.load(Ordering::Relaxed), 0);
+            }
+        }
     }
+
     #[test]
     fn message_hooks_release_dispatch_borrows_before_parent_mutation() {
         struct ParentInspector {
+            opcodes: OpcodeSet,
             pc: usize,
             result_word: Word,
             hooks: usize,
@@ -1772,6 +2067,10 @@ mod tests {
                     self.step_ends += 1;
                 }
             }
+
+            fn inspected_opcodes(&self) -> OpcodeSet {
+                self.opcodes
+            }
         }
 
         for opcode in
@@ -1814,37 +2113,47 @@ mod tests {
                 code.push(op::RETURN);
             }
             for override_result in [false, true] {
-                let (result, inspector, _) = run_evm_with_inspector(
-                    code.clone(),
-                    &MessageExt::default(),
-                    100_000,
-                    ParentInspector {
-                        pc,
-                        result_word,
-                        hooks: 0,
-                        step_ends: 0,
-                        override_result,
-                        completion_gas: 0,
-                        observations: Vec::new(),
-                    },
-                );
-                assert_eq!(
-                    result.stop,
-                    if cfg!(miri) { InstrStop::Stop } else { InstrStop::Return }
-                );
-                assert_eq!(inspector.hooks, 2);
-                assert_eq!(inspector.step_ends, 1);
-                #[cfg(not(miri))]
-                assert_eq!(
-                    result
-                        .output
-                        .as_chunks::<32>()
-                        .0
-                        .iter()
-                        .map(|word| Word::from_be_bytes(*word))
-                        .collect::<Vec<_>>(),
-                    [inspector.result_word, Word::from(456), Word::from(123), Word::from(99)],
-                );
+                let mut reference = None;
+                for opcodes in [OpcodeSet::EMPTY, OpcodeSet::ALL] {
+                    let (result, inspector, _) = run_evm_with_inspector(
+                        code.clone(),
+                        &MessageExt::default(),
+                        100_000,
+                        ParentInspector {
+                            opcodes,
+                            pc,
+                            result_word,
+                            hooks: 0,
+                            step_ends: 0,
+                            override_result,
+                            completion_gas: 0,
+                            observations: Vec::new(),
+                        },
+                    );
+                    assert_eq!(
+                        result.stop,
+                        if cfg!(miri) { InstrStop::Stop } else { InstrStop::Return }
+                    );
+                    assert_eq!(inspector.hooks, 2);
+                    assert_eq!(inspector.step_ends, usize::from(opcodes.is_full()));
+                    #[cfg(not(miri))]
+                    assert_eq!(
+                        result
+                            .output
+                            .as_chunks::<32>()
+                            .0
+                            .iter()
+                            .map(|word| Word::from_be_bytes(*word))
+                            .collect::<Vec<_>>(),
+                        [inspector.result_word, Word::from(456), Word::from(123), Word::from(99)],
+                    );
+                    let observed = (result.gas, inspector.observations);
+                    if let Some(reference) = &reference {
+                        assert_eq!(&observed, reference);
+                    } else {
+                        reference = Some(observed);
+                    }
+                }
             }
         }
     }
@@ -1861,7 +2170,7 @@ mod tests {
             };
         }
         let mut reference = None;
-        for inspected in [false, true] {
+        for opcodes in [None, Some(OpcodeSet::EMPTY), Some(OpcodeSet::ALL)] {
             let mut evm = Evm::<BaseEvmTypes>::new_with_execution_config(
                 ExecutionConfig::for_config::<RemappedCall>(),
                 SpecId::OSAKA,
@@ -1870,8 +2179,11 @@ mod tests {
                 EmptyDB::default(),
                 Precompiles::base(SpecId::OSAKA),
             );
-            if inspected {
-                evm.set_inspector(SharedE2eInspector::default());
+            if let Some(opcodes) = opcodes {
+                evm.set_inspector(SharedE2eInspector {
+                    opcodes: Some(opcodes),
+                    ..Default::default()
+                });
             }
             let mut code = call_code(Address::from([0x22; 20]));
             code.extend([0x0c, op::ISZERO]);
@@ -1893,5 +2205,44 @@ mod tests {
                 reference = Some(result);
             }
         }
+    }
+
+    #[test]
+    fn synthetic_frame_keeps_message_snapshot_during_hook_mutation() {
+        struct SnapshotInspector;
+
+        impl Inspector<BaseEvmTypes> for SnapshotInspector {
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                assert_eq!(interp.message().input, Bytes::from_static(b"before"));
+                message.input = Bytes::from_static(b"after");
+                assert_eq!(interp.message().input, Bytes::from_static(b"before"));
+                Some(MessageResultExt {
+                    stop: InstrStop::Return,
+                    gas: GasTracker::new(message.gas_limit),
+                    ..Default::default()
+                })
+            }
+
+            fn call_end(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &Message<BaseEvmTypes>,
+                _result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                assert_eq!(interp.message().input, Bytes::from_static(b"before"));
+                assert_eq!(message.input, Bytes::from_static(b"after"));
+            }
+        }
+
+        let _ = run_evm_with_inspector(
+            vec![op::STOP],
+            &MessageExt { input: Bytes::from_static(b"before"), ..Default::default() },
+            100_000,
+            SnapshotInspector,
+        );
     }
 }

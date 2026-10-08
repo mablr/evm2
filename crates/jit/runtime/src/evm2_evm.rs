@@ -50,7 +50,8 @@ pub fn run_interpreter<'frame, 'host>(
     host: &mut Evm<'host, BaseEvmTypes>,
 ) -> Option<InstrStop> {
     // Disabled runners must not hash code merely to discover that lookup is unavailable.
-    if !backend.enabled() {
+    // Compiled execution does not yet preserve retained inspector hooks and their frame state.
+    if host.inspector().is_some() || !backend.enabled() {
         return None;
     }
     let code_hash = interpreter.original_bytecode_hash();
@@ -72,10 +73,6 @@ pub fn run_interpreter<'frame, 'host>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "llvm")]
-    use crate::runtime::RuntimeConfig;
-    #[cfg(feature = "llvm")]
-    use alloy_primitives::Address;
     use alloy_primitives::Bytes;
     use evm2::{
         BaseEvmConfigSelector, BaseEvmTypes, Evm, EvmConfigSelector, Precompiles, SpecId,
@@ -85,8 +82,14 @@ mod tests {
         evm::EmptyDB,
         interpreter::{MessageExt, op},
     };
+
+    #[cfg(feature = "llvm")]
+    use crate::runtime::RuntimeConfig;
+    #[cfg(feature = "llvm")]
+    use alloy_primitives::Address;
     #[cfg(feature = "llvm")]
     use evm2::{
+        Inspector,
         evm::{AccountInfo, InMemoryDB},
         interpreter::Word,
     };
@@ -562,5 +565,50 @@ mod tests {
         let interpreter = run(false);
         let jit = run(true);
         assert_eq!(jit, interpreter);
+    }
+
+    #[test]
+    #[cfg(feature = "llvm")]
+    fn inspected_frames_decline_available_compiled_programs() {
+        struct Hooks(evm2::interpreter::OpcodeSet);
+        impl Inspector<BaseEvmTypes> for Hooks {
+            fn inspected_opcodes(&self) -> evm2::interpreter::OpcodeSet {
+                self.0
+            }
+        }
+        let config = <BaseEvmConfigSelector as EvmConfigSelector<BaseEvmTypes>>::execution_config(
+            SpecId::OSAKA,
+        );
+        let backend = blocking_backend();
+        let bytecode = Bytecode::new_legacy(Bytes::from_static(BYTECODE_RET42));
+        assert!(matches!(
+            backend.lookup(LookupRequest {
+                key: RuntimeCacheKey { code_hash: bytecode.hash_slow(), spec_id: SpecId::OSAKA },
+                code: Bytes::copy_from_slice(bytecode.original_byte_slice()),
+            }),
+            LookupDecision::Compiled(_)
+        ));
+        let mut host = Evm::<BaseEvmTypes>::new(
+            SpecId::OSAKA,
+            BlockEnvExt::default(),
+            ethereum_tx_registry(SpecId::OSAKA),
+            EmptyDB::default(),
+            Precompiles::base(SpecId::OSAKA),
+        );
+        let tx = TxEnvExt::default();
+        let message = MessageExt { gas_limit: 100_000, code: bytecode, ..Default::default() };
+        let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx, &message);
+        // Prove the same prepared program is runnable without an inspector.
+        assert_eq!(
+            run_interpreter(&backend, &config, &mut interpreter, &mut host),
+            Some(InstrStop::Return)
+        );
+        let lookups = backend.stats().lookup_hits;
+        for opcodes in [evm2::interpreter::OpcodeSet::EMPTY, evm2::interpreter::OpcodeSet::ALL] {
+            host.set_inspector(Hooks(opcodes));
+            let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx, &message);
+            assert_eq!(run_interpreter(&backend, &config, &mut interpreter, &mut host), None);
+            assert_eq!(backend.stats().lookup_hits, lookups);
+        }
     }
 }

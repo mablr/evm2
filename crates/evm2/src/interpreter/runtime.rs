@@ -3,7 +3,7 @@ use super::{
     StackBacking, StackMut, StackRef, Word,
 };
 use crate::{
-    EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId, Version,
+    EvmTypesHost, ExecutionConfig, ExecutionError, HostError, InterpreterRunner, SpecId, Version,
     bytecode::Bytecode,
     env::TxEnv,
     evm::{NonStaticAny, inspector::Inspector},
@@ -397,14 +397,34 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         host: &mut T::Host<'host>,
         inspector: &mut (dyn Inspector<T> + 'host),
     ) -> Result<InstrStop, ExecutionError> {
+        let step_opcodes = !inspector.inspected_opcodes().is_empty();
+        self.run_with_inspector(config, host, inspector, step_opcodes, None)
+    }
+
+    /// Runs with retained inspector hooks and optional per-opcode callbacks.
+    pub(crate) fn run_with_inspector(
+        &mut self,
+        config: &ExecutionConfig<T>,
+        host: &mut T::Host<'host>,
+        inspector: &mut (dyn Inspector<T> + 'host),
+        step_opcodes: bool,
+        runner: Option<&dyn InterpreterRunner<T>>,
+    ) -> Result<InstrStop, ExecutionError> {
         let inspector = Some(NonNull::from(inspector));
+        if !step_opcodes && let Some(runner) = runner {
+            self.prepare_run(config.base_spec_id(), config.version(), host);
+            self.inspector = inspector;
+            if let Some(stop) = runner.run(config, self, host) {
+                return self.finish_run(stop);
+            }
+        }
         self.run_inner(
             config.base_spec_id(),
             config.version(),
             host,
             inspector,
-            config.inspect_instructions,
-            true,
+            if step_opcodes { config.inspect_instructions } else { config.instructions },
+            step_opcodes,
         )
     }
 
@@ -842,7 +862,9 @@ mod owned_error_tests {
     use crate::{
         BaseEvmConfig, DatabaseError, EvmConfig, OpcodeConfig,
         env::TxEnvExt,
-        interpreter::{GasTracker, MessageExt, MessageResultExt, instructions, op, private},
+        interpreter::{
+            GasTracker, MessageExt, MessageResultExt, OpcodeSet, instructions, op, private,
+        },
         test_utils::{TestHost, TestTypes},
     };
 
@@ -877,21 +899,32 @@ mod owned_error_tests {
             assert!(!parent.host_bound);
         }
 
-        let tx = TxEnvExt::default();
-        let message = parent_call_message();
-        let mut parent = Interpreter::<TestTypes>::new(&tx, &message);
-        let config = ExecutionConfig::for_config::<BaseEvmConfig<{ SpecId::OSAKA as u32 }>>();
-        let mut host = TestHost {
-            message_hook: Some(inspect),
-            execute_result: MessageResultExt { gas: GasTracker::new(1000), ..Default::default() },
-            ..Default::default()
-        };
-        assert_eq!(
-            parent.run_inspect(&config, &mut host, &mut crate::NoopInspector::default()),
-            Ok(InstrStop::Stop)
-        );
-        assert_eq!(parent.stack().as_slice(), &[Word::from(99), Word::from(1)]);
-        assert_eq!(parent.gas().remaining(), 99_879);
+        struct Hooks(OpcodeSet);
+        impl Inspector<TestTypes> for Hooks {
+            fn inspected_opcodes(&self) -> OpcodeSet {
+                self.0
+            }
+        }
+        for opcodes in [OpcodeSet::EMPTY, OpcodeSet::ALL] {
+            let tx = TxEnvExt::default();
+            let message = parent_call_message();
+            let mut parent = Interpreter::<TestTypes>::new(&tx, &message);
+            let config = ExecutionConfig::for_config::<BaseEvmConfig<{ SpecId::OSAKA as u32 }>>();
+            let mut host = TestHost {
+                message_hook: Some(inspect),
+                execute_result: MessageResultExt {
+                    gas: GasTracker::new(1000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(
+                parent.run_inspect(&config, &mut host, &mut Hooks(opcodes)),
+                Ok(InstrStop::Stop)
+            );
+            assert_eq!(parent.stack().as_slice(), &[Word::from(99), Word::from(1)]);
+            assert_eq!(parent.gas().remaining(), 99_879);
+        }
     }
 
     #[test]
@@ -962,6 +995,7 @@ mod owned_error_tests {
             ..Default::default()
         }
     }
+
     #[test]
     fn call_wrapper_error_cancels_suspension_and_reaches_step_end() {
         struct RejectCall;
@@ -990,8 +1024,7 @@ mod owned_error_tests {
             };
         }
 
-        #[derive(Default)]
-        struct Rejections(usize);
+        struct Rejections(usize, OpcodeSet);
 
         impl Inspector<TestTypes> for Rejections {
             fn step_end(&mut self, interp: &mut Interpreter<'_, '_, TestTypes>) {
@@ -1000,26 +1033,31 @@ mod owned_error_tests {
                     self.0 += 1;
                 }
             }
+
+            fn inspected_opcodes(&self) -> OpcodeSet {
+                self.1
+            }
         }
 
-        for inspected in [false, true] {
+        for opcodes in [None, Some(OpcodeSet::EMPTY), Some(OpcodeSet::ALL)] {
             let tx = TxEnvExt::default();
             let message = parent_call_message();
             let mut parent = Interpreter::<TestTypes>::new(&tx, &message);
             let config = ExecutionConfig::for_config::<Config>();
             let mut host = TestHost::default();
-            let mut inspector = Rejections::default();
-            let result = if inspected {
+            let mut inspector = Rejections(0, opcodes.unwrap_or(OpcodeSet::ALL));
+            let result = if opcodes.is_some() {
                 parent.run_inspect(&config, &mut host, &mut inspector)
             } else {
                 parent.run(&config, &mut host)
             };
             assert_eq!(result, Ok(InstrStop::OutOfGas));
             assert!(parent.pending_message.is_none());
-            assert_eq!(host.calls.len(), usize::from(!inspected));
-            assert_eq!(inspector.0, usize::from(inspected));
+            assert_eq!(host.calls.len(), usize::from(opcodes.is_none()));
+            assert_eq!(inspector.0, usize::from(opcodes == Some(OpcodeSet::ALL)));
         }
     }
+
     #[test]
     fn call_wrapper_observes_precompletion_state_when_inspected() {
         struct ObserveCall;
@@ -1050,8 +1088,7 @@ mod owned_error_tests {
             };
         }
 
-        #[derive(Default)]
-        struct Completion(usize);
+        struct Completion(usize, OpcodeSet);
 
         impl Inspector<TestTypes> for Completion {
             fn step_end(&mut self, interp: &mut Interpreter<'_, '_, TestTypes>) {
@@ -1060,9 +1097,13 @@ mod owned_error_tests {
                     assert_eq!(interp.stack().as_slice(), &[Word::from(1)]);
                 }
             }
+
+            fn inspected_opcodes(&self) -> OpcodeSet {
+                self.1
+            }
         }
 
-        for inspected in [false, true] {
+        for opcodes in [None, Some(OpcodeSet::EMPTY), Some(OpcodeSet::ALL)] {
             let tx = TxEnvExt::default();
             let message = parent_call_message();
             let mut parent = Interpreter::<TestTypes>::new(&tx, &message);
@@ -1075,8 +1116,8 @@ mod owned_error_tests {
                 },
                 ..Default::default()
             };
-            let mut inspector = Completion::default();
-            let result = if inspected {
+            let mut inspector = Completion(0, opcodes.unwrap_or(OpcodeSet::ALL));
+            let result = if opcodes.is_some() {
                 parent.run_inspect(&config, &mut host, &mut inspector)
             } else {
                 parent.run(&config, &mut host)
@@ -1085,9 +1126,9 @@ mod owned_error_tests {
             assert_eq!(parent.return_data(), &Bytes::from_static(b"child"));
             assert_eq!(
                 host.tload(&Address::ZERO, &Word::ZERO),
-                Word::from(if inspected { 0 } else { 5 })
+                Word::from(if opcodes.is_some() { 0 } else { 5 })
             );
-            assert_eq!(inspector.0, if inspected { 5 } else { 0 });
+            assert_eq!(inspector.0, if opcodes == Some(OpcodeSet::ALL) { 5 } else { 0 });
         }
     }
 }

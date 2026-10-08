@@ -188,6 +188,10 @@ pub use prewarm_set::PrewarmSet;
 ///
 /// Returning `Some(stop)` means the runner executed the frame. Returning `None` makes the EVM run
 /// the regular interpreter for the same frame.
+///
+/// Runners are also offered frames whose inspector requests no opcode stepping. They must
+/// preserve frame, message, log, and self-destruct hooks and live interpreter state visible to
+/// those hooks, or return `None` to fall back to the interpreter.
 pub trait InterpreterRunner<T: EvmTypesHost>: core::fmt::Debug + Send + Sync + 'static {
     /// Attempts to execute `interpreter` with an external backend.
     ///
@@ -1446,6 +1450,11 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         // Share immutable configuration without borrowing a field of the mutable host.
         let execution_config = guard.evm.execution_config.clone();
         guard.evm.inspect_initialize_interp(interp_ref, &execution_config);
+        let step_opcodes = guard
+            .evm
+            .inspector
+            .as_deref()
+            .is_some_and(|inspector| !inspector.inspected_opcodes().is_empty());
         let interpreter_runner = guard.evm.interpreter_runner.clone();
         let stop = if let Some(error) = interp_ref.take_error() {
             Err(error)
@@ -1454,7 +1463,13 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         } else if let Some(inspector) = guard.evm.inspector.as_deref_mut() {
             // SAFETY: The execution guard prevents inspector replacement during this run.
             let inspector = unsafe { trustme::decouple_lt_mut(inspector) };
-            interp_ref.run_inspect(&execution_config, guard.evm, inspector)
+            interp_ref.run_with_inspector(
+                &execution_config,
+                guard.evm,
+                inspector,
+                step_opcodes,
+                interpreter_runner.as_deref(),
+            )
         } else if let Some(runner) = interpreter_runner
             && let Some(stop) = runner.run(&execution_config, interp_ref, guard.evm)
         {

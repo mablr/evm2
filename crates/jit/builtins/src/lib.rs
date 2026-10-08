@@ -740,7 +740,7 @@ pub unsafe extern "C" fn __revmc_builtin_create(
         ext: (),
         _non_exhaustive: (),
     };
-    let mut result = ecx.host().execute_message(tx_env, &mut message).map_err(|error| ecx.interpreter_mut().fail(error))?;
+    let mut result = ecx.host().execute_message(tx_env, &mut message, None).map_err(|error| ecx.interpreter_mut().fail(error))?;
     if result.stop.is_fatal() {
         return Err(result.stop.into());
     }
@@ -850,7 +850,7 @@ pub unsafe extern "C" fn __revmc_builtin_call(
     };
 
     let tx_env = ecx.tx_env();
-    let mut result = ecx.host().execute_message(tx_env, &mut message).map_err(|error| ecx.interpreter_mut().fail(error))?;
+    let mut result = ecx.host().execute_message(tx_env, &mut message, None).map_err(|error| ecx.interpreter_mut().fail(error))?;
     if result.stop.is_fatal() {
         return Err(result.stop.into());
     }

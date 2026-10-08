@@ -408,7 +408,7 @@ mod tests {
         BaseEvmConfigSelector, EvmFeatures, EvmTypesHost, SpecId,
         env::{BlockEnv, BlockEnvExt, TxEnv},
         evm::{AccountLoad, SLoad, SStore, SelfDestructResult},
-        interpreter::{Host, Message, MessageResult, Word},
+        interpreter::{Host, Interpreter, Message, MessageResult, Word},
     };
     use alloc::{rc::Rc, string::ToString, vec::Vec};
     use alloy_primitives::{Address, B256, Log};
@@ -524,6 +524,7 @@ mod tests {
             &mut self,
             _tx_env: &TxEnv<TestTypes>,
             _message: &mut Message<TestTypes>,
+            _parent: Option<&mut Interpreter<'_, '_, TestTypes>>,
         ) -> Result<MessageResult<TestTypes>, crate::ExecutionError> {
             unimplemented!()
         }

@@ -205,7 +205,7 @@ pub fn execute_prepared<T: EvmTypes, H: TxHandlerHooks<T>>(
     // applied delegations, which stay) inside `execute_message`. The settle merges the frame gas
     // into `tx_gas`, which carries the authorization state gas into the block state-gas
     // accounting.
-    let mut result = req.host.execute_message(&tx_env, &mut message)?;
+    let mut result = req.host.execute_message(&tx_env, &mut message, None)?;
     settle_initial_frame_gas(&mut tx_gas, &mut result, charged_state_gas);
     settle(req.host, result)
 }

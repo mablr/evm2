@@ -39,8 +39,9 @@ pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
 
     /// Called before a call message executes.
     ///
-    /// The interpreter is the currently running frame whose instruction produced the message; for
-    /// the top-level message it is a frame initialized with the message itself.
+    /// The interpreter is the suspended parent, with CALL/CREATE operands consumed and gas
+    /// charged. Its PC points to that instruction. Messages without an interpreter parent use
+    /// a synthetic frame holding a snapshot of the message before hooks mutate it.
     #[inline]
     fn call(
         &mut self,
@@ -67,8 +68,9 @@ pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
 
     /// Called before a create message executes.
     ///
-    /// The interpreter is the currently running frame whose instruction produced the message; for
-    /// the top-level message it is a frame initialized with the message itself.
+    /// The interpreter is the suspended parent, with CALL/CREATE operands consumed and gas
+    /// charged. Its PC points to that instruction. Messages without an interpreter parent use
+    /// a synthetic frame holding a snapshot of the message before hooks mutate it.
     #[inline]
     fn create(
         &mut self,
@@ -143,16 +145,16 @@ impl<'a, T: EvmTypesHost> core::ops::DerefMut for dyn Inspector<T> + 'a {
 mod tests {
     use super::Inspector;
     use crate::{
-        BaseEvmConfigSelector, BaseEvmTypes, DatabaseError, Evm, EvmTypesHost, ExecutionConfig,
-        Precompiles, SpecId,
+        BaseEvmConfigSelector, BaseEvmTypes, DatabaseError, Evm, EvmConfig, EvmTypesHost,
+        ExecutionConfig, OpcodeConfig, Precompiles, SpecId,
         bytecode::Bytecode,
         constants::CALL_DEPTH_LIMIT,
         env::{BlockEnvExt, TxEnvExt},
         ethereum::{TxEnvelope, ethereum_tx_registry},
         evm::{AccountInfo, EmptyDB, InMemoryDB, SYSTEM_ADDRESS, State},
         interpreter::{
-            GasTracker, Host, InstrStop, Interpreter, Message, MessageExt, MessageResult,
-            MessageResultExt, Word, op,
+            Gas, GasTracker, Host, InstrStop, Interpreter, Message, MessageExt, MessageResult,
+            MessageResultExt, Word, instructions, op,
         },
         registry::TxRegistry,
         test_utils::{TestHost, TestTypes, legacy_bytecode, push, push_all},
@@ -393,7 +395,7 @@ mod tests {
         let tx_env = TxEnvExt::default();
         let bytecode = legacy_bytecode(code);
         let mut message = MessageExt { gas_limit, code: bytecode, ..message.clone() };
-        let result = Host::execute_message(&mut evm, &tx_env, &mut message).unwrap();
+        let result = Host::execute_message(&mut evm, &tx_env, &mut message, None).unwrap();
         let inspector = evm.clear_inspector_as::<I>().unwrap();
         (result, inspector, evm)
     }
@@ -842,7 +844,7 @@ mod tests {
         let tx_env = TxEnvExt::default();
         let bytecode = legacy_bytecode(code);
         let mut message = MessageExt { gas_limit: 100_000, code: bytecode, ..Default::default() };
-        let result = Host::execute_message(&mut evm, &tx_env, &mut message).unwrap();
+        let result = Host::execute_message(&mut evm, &tx_env, &mut message, None).unwrap();
 
         assert_matches!(result.stop, InstrStop::Stop);
         // The redirected call transferred the value to the replacement, not the target.
@@ -1683,5 +1685,213 @@ mod tests {
             100_000,
             SnapshotInspector,
         );
+    }
+    #[test]
+    fn message_hooks_release_dispatch_borrows_before_parent_mutation() {
+        struct ParentInspector {
+            pc: usize,
+            result_word: Word,
+            hooks: usize,
+            step_ends: usize,
+            override_result: bool,
+            completion_gas: u64,
+            observations: Vec<Gas>,
+        }
+
+        impl Inspector<BaseEvmTypes> for ParentInspector {
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                if message.depth == 0 {
+                    return None;
+                }
+                assert_eq!(interp.message().depth + 1, message.depth);
+                assert_eq!(interp.pc(), self.pc);
+                assert_eq!(interp.stack().as_slice(), &[Word::from(99)]);
+                self.observations.push(interp.gas());
+                interp.stack_mut().push(Word::from(123)).unwrap();
+                interp.gas_mut().set_remaining(5_000);
+                interp.host().tstore(&Address::ZERO, &Word::ZERO, &Word::from(123));
+                self.hooks += 1;
+                self.override_result.then(|| MessageResultExt {
+                    stop: InstrStop::Return,
+                    gas: GasTracker::new(100),
+                    created_address: Some(Address::from([0x77; 20])),
+                    ..Default::default()
+                })
+            }
+
+            fn call_end(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &Message<BaseEvmTypes>,
+                result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                if message.depth > 0 {
+                    assert_eq!(interp.pc(), self.pc);
+                    assert_eq!(interp.stack().as_slice(), &[Word::from(99), Word::from(123)]);
+                    self.observations.push(interp.gas());
+                    if message.kind.is_create() {
+                        self.result_word = result.created_address_for_parent();
+                    }
+                    self.completion_gas = 4_000 + result.gas.remaining();
+                    interp.stack_mut().push(Word::from(456)).unwrap();
+                    interp.gas_mut().set_remaining(4_000);
+                    assert_eq!(interp.host().tload(&Address::ZERO, &Word::ZERO), Word::from(123));
+                    self.hooks += 1;
+                }
+            }
+
+            fn create(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                self.call(interp, message)
+            }
+
+            fn create_end(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &Message<BaseEvmTypes>,
+                result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                self.call_end(interp, message, result);
+            }
+
+            fn step_end(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                if interp.pc() == self.pc + 1 && interp.result().is_ok() {
+                    assert_eq!(self.hooks, 2);
+                    assert_eq!(interp.gas().remaining(), self.completion_gas);
+                    assert_eq!(
+                        interp.stack().as_slice(),
+                        &[Word::from(99), Word::from(123), Word::from(456), self.result_word],
+                    );
+                    self.step_ends += 1;
+                }
+            }
+        }
+
+        for opcode in
+            [op::CALL, op::CALLCODE, op::DELEGATECALL, op::STATICCALL, op::CREATE, op::CREATE2]
+        {
+            let is_create = matches!(opcode, op::CREATE | op::CREATE2);
+            let result_word =
+                if is_create { address_to_word(&Address::from([0x77; 20])) } else { Word::from(1) };
+            let mut code = Vec::new();
+            push(&mut code, Word::from(99));
+            if is_create {
+                push_all(&mut code, [Word::ZERO; 3]);
+                if opcode == op::CREATE2 {
+                    push(&mut code, Word::ZERO);
+                }
+            } else {
+                push_all(&mut code, [Word::ZERO; 4]);
+                if matches!(opcode, op::CALL | op::CALLCODE) {
+                    push(&mut code, Word::ZERO);
+                }
+                push_all(
+                    &mut code,
+                    [address_to_word(&Address::from([0x22; 20])), Word::from(1000)],
+                );
+            }
+            let pc = code.len();
+            code.push(opcode);
+            // Keep Miri focused on message preparation/hooks/completion: other dynamic-gas
+            // instructions still split overlapping gas/state references.
+            #[cfg(miri)]
+            code.push(op::STOP);
+            #[cfg(not(miri))]
+            {
+                // Return all four words; hook-added words must survive completion.
+                for offset in [0, 32, 64, 96] {
+                    push(&mut code, Word::from(offset));
+                    code.push(op::MSTORE);
+                }
+                push_all(&mut code, [Word::from(128), Word::ZERO]);
+                code.push(op::RETURN);
+            }
+            for override_result in [false, true] {
+                let (result, inspector, _) = run_evm_with_inspector(
+                    code.clone(),
+                    &MessageExt::default(),
+                    100_000,
+                    ParentInspector {
+                        pc,
+                        result_word,
+                        hooks: 0,
+                        step_ends: 0,
+                        override_result,
+                        completion_gas: 0,
+                        observations: Vec::new(),
+                    },
+                );
+                assert_eq!(
+                    result.stop,
+                    if cfg!(miri) { InstrStop::Stop } else { InstrStop::Return }
+                );
+                assert_eq!(inspector.hooks, 2);
+                assert_eq!(inspector.step_ends, 1);
+                #[cfg(not(miri))]
+                assert_eq!(
+                    result
+                        .output
+                        .as_chunks::<32>()
+                        .0
+                        .iter()
+                        .map(|word| Word::from_be_bytes(*word))
+                        .collect::<Vec<_>>(),
+                    [inspector.result_word, Word::from(456), Word::from(123), Word::from(99)],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remapped_call_yields_with_retained_inspector() {
+        struct RemappedCall;
+        impl EvmConfig<BaseEvmTypes> for RemappedCall {
+            const BASE_SPEC_ID: SpecId = SpecId::OSAKA;
+            const OPCODE_CONFIG: &'static OpcodeConfig<BaseEvmTypes> = &{
+                let mut config = OpcodeConfig::base::<Self>();
+                config.set_instruction::<instructions::call<BaseEvmTypes>>(0x0c, 100);
+                config
+            };
+        }
+        let mut reference = None;
+        for inspected in [false, true] {
+            let mut evm = Evm::<BaseEvmTypes>::new_with_execution_config(
+                ExecutionConfig::for_config::<RemappedCall>(),
+                SpecId::OSAKA,
+                BlockEnvExt::default(),
+                ethereum_tx_registry(SpecId::OSAKA),
+                EmptyDB::default(),
+                Precompiles::base(SpecId::OSAKA),
+            );
+            if inspected {
+                evm.set_inspector(SharedE2eInspector::default());
+            }
+            let mut code = call_code(Address::from([0x22; 20]));
+            code.extend([0x0c, op::ISZERO]);
+            return_top_word(&mut code);
+            let mut message = MessageExt {
+                gas_limit: 100_000,
+                code: legacy_bytecode(code),
+                ..Default::default()
+            };
+            let result = evm.execute_message(&TxEnvExt::default(), &mut message, None).unwrap();
+            assert_eq!(result.stop, InstrStop::Return);
+            assert_eq!(Word::from_be_slice(&result.output), Word::ZERO);
+            if let Some(inspector) = evm.clear_inspector_as::<SharedE2eInspector>() {
+                assert_eq!(inspector.state.calls, 2);
+            }
+            if let Some(reference) = &reference {
+                assert_eq!(&result, reference);
+            } else {
+                reference = Some(result);
+            }
+        }
     }
 }

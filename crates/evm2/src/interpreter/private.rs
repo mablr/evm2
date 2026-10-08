@@ -8,9 +8,16 @@ pub(crate) type InstructionImplFn<T> =
 /// EVM instruction implementation.
 pub trait Instruction<T: EvmTypesHost = crate::BaseEvmTypes> {
     /// Whether this instruction needs mutable gas state.
+    ///
+    /// Message-producing implementations must enable this for gas synchronization and suspension.
     const DYNAMIC_GAS: bool = true;
 
     /// Executes this instruction.
+    ///
+    /// Inspected CALL/CREATE implementations prepare a message and yield to the interpreter
+    /// loop. Code after a wrapped base instruction runs before child execution and completion;
+    /// use `Inspector::step_end` to observe completed state. Returning an error cancels the
+    /// prepared message. Without inspection, base CALL/CREATE execute the child synchronously.
     fn execute(pc: &mut Pc, stack: StackMut<'_>, state: &mut InterpreterState<'_, '_, T>)
     -> Result;
 }

@@ -237,9 +237,15 @@ fn call_inner<T: EvmTypesHost>(
     *state.gas_mut() = gas;
     let (mut message, completion) = prepared?;
 
+    if state.has_inspector() {
+        state.suspend_message(message, completion);
+        return Ok(());
+    }
     let tx_env = state.tx();
-    let result =
-        state.host().execute_message(tx_env, &mut message).map_err(|error| state.fail(error))?;
+    let result = state
+        .host()
+        .execute_message(tx_env, &mut message, None)
+        .map_err(|error| state.fail(error))?;
     state.complete_message(stack, completion, result)
 }
 
@@ -278,9 +284,15 @@ fn create_inner<T: EvmTypesHost>(
     let prepared = prepare_create(stack.reborrow(), &mut gas, state, is_create2);
     *state.gas_mut() = gas;
     let Some((mut message, completion)) = prepared? else { return Ok(()) };
+    if state.has_inspector() {
+        state.suspend_message(message, completion);
+        return Ok(());
+    }
     let tx_env = state.tx();
-    let result =
-        state.host().execute_message(tx_env, &mut message).map_err(|error| state.fail(error))?;
+    let result = state
+        .host()
+        .execute_message(tx_env, &mut message, None)
+        .map_err(|error| state.fail(error))?;
     state.complete_message(stack, completion, result)
 }
 

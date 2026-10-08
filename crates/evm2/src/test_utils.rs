@@ -50,6 +50,7 @@ pub(crate) struct TestHost {
     pub(crate) selfdestruct_result: SelfDestructResult,
     pub(crate) selfdestruct_error: Option<crate::HostError>,
     pub(crate) calls: Vec<Message<TestTypes>>,
+    pub(crate) message_hook: Option<fn(&mut Self, &mut Interpreter<'_, '_, TestTypes>)>,
     pub(crate) call_static_flags: Vec<bool>,
     pub(crate) selfdestructs: Vec<(Address, Address, bool)>,
     pub(crate) new_account_checks: Vec<Address>,
@@ -79,6 +80,7 @@ impl Default for TestHost {
             selfdestruct_result: SelfDestructResult::default(),
             selfdestruct_error: None,
             calls: Vec::new(),
+            message_hook: None,
             call_static_flags: Vec::new(),
             selfdestructs: Vec::new(),
             new_account_checks: Vec::new(),
@@ -198,6 +200,7 @@ impl Host<TestTypes> for TestHost {
         &mut self,
         _tx_env: &TxEnv<TestTypes>,
         message: &mut Message<TestTypes>,
+        parent: Option<&mut Interpreter<'_, '_, TestTypes>>,
     ) -> Result<MessageResult<TestTypes>, crate::ExecutionError> {
         // Mimics the depth limit enforced by the real host.
         if message.depth > CALL_DEPTH_LIMIT {
@@ -210,6 +213,11 @@ impl Host<TestTypes> for TestHost {
         self.call_static_flags
             .push(message.caller_is_static || message.kind == MessageKind::StaticCall);
         self.calls.push(message.clone());
+        if let Some(hook) = self.message_hook
+            && let Some(parent) = parent
+        {
+            hook(self, parent);
+        }
         match self.execute_error.clone() {
             Some(error) => Err(error),
             None => Ok(self.execute_result.clone()),

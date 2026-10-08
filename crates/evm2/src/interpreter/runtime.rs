@@ -1,6 +1,6 @@
 use super::{
-    BytecodeRef, Gas, InstrStop, Memory, Message, MessageKind, Pc, Result, StackBacking, StackMut,
-    StackRef, Word,
+    BytecodeRef, Gas, InstrStop, Memory, Message, MessageKind, MessageResult, Pc, Result,
+    StackBacking, StackMut, StackRef, Word,
 };
 use crate::{
     EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId, Version,
@@ -13,7 +13,7 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 use alloy_primitives::{Address, B256, Bytes};
-use core::{fmt, hint::cold_path, ops::Range, ptr::NonNull};
+use core::{cmp::min, fmt, hint::cold_path, ops::Range, ptr::NonNull};
 use derive_where::derive_where;
 
 /// EVM interpreter.
@@ -586,12 +586,6 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
         self.0.return_data.clear();
     }
 
-    /// Swaps return data from the last call-like operation.
-    #[inline]
-    pub(crate) const fn swap_return_data(&mut self, return_data: &mut Bytes) {
-        core::mem::swap(&mut self.0.return_data, return_data);
-    }
-
     /// Returns the current frame output memory range.
     #[inline]
     pub const fn output_range(&self) -> &Range<u32> {
@@ -642,6 +636,22 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
                 inspector.as_mut().selfdestruct(contract, target, value, host.as_mut());
             }
         }
+    }
+
+    pub(crate) fn complete_message(
+        &mut self,
+        stack: StackMut<'_>,
+        completion: MessageCompletion,
+        result: MessageResult<T>,
+    ) -> Result {
+        complete_message::<T>(
+            stack,
+            &mut self.0.gas,
+            &mut self.0.memory,
+            &mut self.0.return_data,
+            completion,
+            result,
+        )
     }
 }
 
@@ -711,5 +721,58 @@ mod owned_error_tests {
         assert_eq!(result, Err(ExecutionError::Database(error)));
         assert!(interpreter.error.is_none());
         assert_eq!(interpreter.finish_run(InstrStop::Stop), Ok(InstrStop::Stop));
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum MessageCompletion {
+    Call { output: Range<usize>, new_account_state_gas: u64 },
+    Create { new_account_state_gas: u64 },
+}
+
+fn complete_message<T: EvmTypesHost>(
+    mut stack: StackMut<'_>,
+    gas: &mut Gas,
+    memory: &mut Memory,
+    return_data: &mut Bytes,
+    completion: MessageCompletion,
+    mut result: MessageResult<T>,
+) -> Result {
+    if result.stop.is_fatal() {
+        return Err(result.stop);
+    }
+    gas.merge_child_gas(result.gas, result.stop);
+    match completion {
+        MessageCompletion::Call { output, new_account_state_gas } => {
+            // Refund the upfront account-creation charge if the value-bearing CALL failed.
+            if new_account_state_gas != 0 && !result.stop.is_success() {
+                gas.refill_reservoir(new_account_state_gas);
+            }
+            let copy_len = min(output.len(), result.output.len());
+            if copy_len != 0 {
+                // Hooks can change memory, so reacquire and resize it before copying the output.
+                memory.resize(output.start, copy_len)?;
+                unsafe {
+                    memory.set_unchecked(output.start, result.output.get_unchecked(..copy_len));
+                }
+            }
+            core::mem::swap(return_data, &mut result.output);
+            stack.push(Word::from(result.stop.is_success()))
+        }
+        MessageCompletion::Create { new_account_state_gas } => {
+            // CREATE failures leave no new account and refund its conditional state charge.
+            if new_account_state_gas != 0
+                && (result.created_address.is_none() || !result.stop.is_success())
+            {
+                gas.refill_reservoir(new_account_state_gas);
+            }
+            // EIP-211 exposes only CREATE revert data.
+            if result.stop == InstrStop::Revert {
+                core::mem::swap(return_data, &mut result.output);
+            } else {
+                return_data.clear();
+            }
+            stack.push(result.created_address_for_parent())
+        }
     }
 }

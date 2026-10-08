@@ -1645,4 +1645,43 @@ mod tests {
             assert_eq!(interp.gas().remaining(), 1000);
         }
     }
+
+    #[test]
+    fn synthetic_frame_keeps_message_snapshot_during_hook_mutation() {
+        struct SnapshotInspector;
+
+        impl Inspector<BaseEvmTypes> for SnapshotInspector {
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                assert_eq!(interp.message().input, Bytes::from_static(b"before"));
+                message.input = Bytes::from_static(b"after");
+                assert_eq!(interp.message().input, Bytes::from_static(b"before"));
+                Some(MessageResultExt {
+                    stop: InstrStop::Return,
+                    gas: GasTracker::new(message.gas_limit),
+                    ..Default::default()
+                })
+            }
+
+            fn call_end(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &Message<BaseEvmTypes>,
+                _result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                assert_eq!(interp.message().input, Bytes::from_static(b"before"));
+                assert_eq!(message.input, Bytes::from_static(b"after"));
+            }
+        }
+
+        let _ = run_evm_with_inspector(
+            vec![op::STOP],
+            &MessageExt { input: Bytes::from_static(b"before"), ..Default::default() },
+            100_000,
+            SnapshotInspector,
+        );
+    }
 }

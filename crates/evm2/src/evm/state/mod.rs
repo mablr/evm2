@@ -406,6 +406,47 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Restores runtime access warmth added since a checkpoint without reverting writes.
+    ///
+    /// Journal entries remain in place so live frame checkpoints keep their cursors. Storage
+    /// values and originals, account lifetime flags, and mandatory transaction warmth are retained.
+    pub fn restore_access_warmth(&mut self, checkpoint: &StateCheckpoint) {
+        let mut accounts = alloy_primitives::map::AddressSet::default();
+        for entry in self.inner.journal.iter().skip(checkpoint.journal_len()) {
+            match entry {
+                JournalEntry::AccountChange { address, previous_is_warm, .. } => {
+                    if accounts.insert(*address)
+                        && let Some(account) = self.accounts.get_mut(address)
+                    {
+                        account.is_warm = *previous_is_warm;
+                    }
+                }
+                JournalEntry::StorageWarmed { address, key } => {
+                    if let Some(storage) = self.storage.get_mut(address)
+                        && let Some(slot) = storage.slots.get_mut(key)
+                    {
+                        slot.is_warm = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Cools loaded runtime accesses without changing values, originals, or journal entries.
+    ///
+    /// Transaction-base pre-warmed addresses and slots retain their effective warmth.
+    pub fn cool_loaded_state(&mut self) {
+        for (address, account) in &mut self.accounts {
+            account.is_warm = self.inner.prewarm_set.is_warm(address);
+        }
+        for storage in self.storage.values_mut() {
+            for slot in storage.slots.values_mut() {
+                slot.is_warm = false;
+            }
+        }
+    }
+
     /// Reads a storage slot from the committed state (accepted overlay and backing database),
     /// ignoring the in-flight transaction overlay.
     #[inline]
@@ -889,7 +930,10 @@ impl<'a> State<'a> {
     /// transaction substate such as touches and selfdestructs, while finalization
     /// turns that substate into account deletions, storage wipes, balance-only
     /// selfdestruct resets (EIP-8246), or pre-EIP-161 empty-account materialization.
-    pub(crate) fn finalize_transaction(&mut self, version: &Version) -> DbResult<()> {
+    /// Call only after the transaction's last revertible scope. This does not commit or clear
+    /// transaction scratch; callers accepting suspended state must do both afterward. On error,
+    /// dispose the session rather than reuse partially finalized state.
+    pub fn finalize_transaction(&mut self, version: &Version) -> DbResult<()> {
         let selfdestructs = mem::take(&mut self.selfdestructs);
         let touched: Vec<_> = self
             .accounts
@@ -1460,5 +1504,72 @@ mod tests {
             assert_eq!(slot.is_warm(), key == Word::ONE);
             assert_eq!((slot.original(), slot.current()), (Word::ZERO, Word::from(7)));
         }
+    }
+
+    #[test]
+    fn cooling_loaded_state_preserves_values_originals_and_rollback() {
+        let address = Address::with_last_byte(42);
+        let base = Address::with_last_byte(43);
+        let key = Word::ZERO;
+        let mut state = State::new(EmptyDB::default());
+        state.prewarm(&base);
+        state.account(&address).unwrap().warm();
+        state.account(&base).unwrap().warm();
+        let checkpoint = state.checkpoint();
+        {
+            let mut slot = state.storage_slot(&address, key).unwrap();
+            slot.warm();
+            slot.write(Word::from(7));
+        }
+        state.tstore(&address, &key, &Word::from(9));
+        let journal = state.journal().to_vec();
+        state.cool_loaded_state();
+        assert_eq!(state.journal(), journal);
+        assert!(!state.account(&address).unwrap().is_warm());
+        assert!(state.account(&base).unwrap().is_warm());
+        {
+            let slot = state.storage_slot(&address, key).unwrap();
+            assert!(!slot.is_warm());
+            assert_eq!((slot.original(), slot.current()), (Word::ZERO, Word::from(7)));
+        }
+        assert_eq!(state.tload(&address, &key), Word::from(9));
+        state.rollback(checkpoint, Version::new(crate::SpecId::CANCUN).features);
+        assert_eq!(state.storage_slot(&address, key).unwrap().current(), Word::ZERO);
+        assert_eq!(state.tload(&address, &key), Word::ZERO);
+    }
+
+    #[test]
+    fn restore_access_warmth_keeps_writes_originals_and_journal_cursors() {
+        let address = Address::with_last_byte(41);
+        let base = Address::with_last_byte(42);
+        let key = Word::from(3);
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default());
+        db.insert_account_storage(&address, &key, &Word::from(10));
+        let mut state = State::new(db);
+        state.prewarm(&base);
+        let checkpoint = state.checkpoint();
+        state.account(&address).unwrap().warm();
+        state.account(&address).unwrap().set_balance(Word::from(5));
+        {
+            let mut slot = state.storage_slot(&address, key).unwrap();
+            slot.warm();
+            slot.write(Word::from(20));
+        }
+        state.account(&base).unwrap().warm();
+        let journal = state.journal().to_vec();
+        state.restore_access_warmth(&checkpoint);
+        assert_eq!(state.journal(), journal);
+        assert!(!state.account(&address).unwrap().is_warm());
+        assert!(state.account(&base).unwrap().is_warm());
+        assert_eq!(state.account(&address).unwrap().balance(), Word::from(5));
+        {
+            let slot = state.storage_slot(&address, key).unwrap();
+            assert!(!slot.is_warm());
+            assert_eq!((slot.original(), slot.current()), (Word::from(10), Word::from(20)));
+        }
+        state.rollback(checkpoint, Version::new(crate::SpecId::CANCUN).features);
+        assert_eq!(state.account(&address).unwrap().balance(), Word::ZERO);
+        assert_eq!(state.storage_slot(&address, key).unwrap().current(), Word::from(10));
     }
 }

@@ -362,6 +362,53 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Restores runtime access warmth added since a checkpoint without reverting writes.
+    ///
+    /// Journal entries remain in place so live frame checkpoints keep their cursors. Storage
+    /// values and originals, account lifetime flags, and mandatory transaction warmth are retained.
+    pub fn restore_access_warmth(&mut self, checkpoint: &StateCheckpoint) {
+        let mut accounts = alloy_primitives::map::AddressSet::default();
+        for entry in self.inner.journal.iter().skip(checkpoint.journal_len()) {
+            match entry {
+                JournalEntry::AccountChange { address, previous_is_warm, .. } => {
+                    if accounts.insert(*address)
+                        && let Some(account) = self.accounts.get_mut(address)
+                    {
+                        account.is_warm = *previous_is_warm;
+                    }
+                }
+                JournalEntry::StorageWarmed { address, key } => {
+                    if let Some(slot) = self
+                        .accounts
+                        .get_mut(address)
+                        .and_then(|account| account.storage.slots.get_mut(key))
+                    {
+                        slot.is_warm = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Cools loaded runtime accesses without changing values, originals, or journal entries.
+    ///
+    /// Transaction-base pre-warmed addresses and slots retain their effective warmth.
+    pub fn cool_loaded_state(&mut self) {
+        for (address, account) in &mut self.accounts {
+            account.is_warm = self.inner.prewarm_set.is_warm(address);
+            for slot in account.storage.slots.values_mut() {
+                slot.is_warm = false;
+            }
+        }
+    }
+
+    /// Replaces the pre-warmed set, such as when resuming a suspended state inside a running
+    /// transaction whose access list and base warmth must carry over.
+    pub fn set_prewarm_set(&mut self, prewarm_set: PrewarmSet) {
+        self.inner.prewarm_set = prewarm_set;
+    }
+
     /// Reads a storage slot from the committed state (accepted overlay and backing database),
     /// ignoring the in-flight transaction overlay.
     #[inline]
@@ -815,7 +862,11 @@ impl<'a> State<'a> {
     /// transaction substate such as touches and selfdestructs, while finalization
     /// turns that substate into account deletions, storage wipes, balance-only
     /// selfdestruct resets (EIP-8246), or pre-EIP-161 empty-account materialization.
-    pub(crate) fn finalize_transaction(&mut self, version: &Version) -> DbResult<()> {
+    ///
+    /// Call only after the transaction's last revertible scope. This does not commit or clear
+    /// transaction scratch; callers accepting suspended state must do both afterward. On error,
+    /// dispose the session rather than reuse partially finalized state.
+    pub fn finalize_transaction(&mut self, version: &Version) -> DbResult<()> {
         let selfdestructs = mem::take(&mut self.selfdestructs);
         let touched: Vec<_> = self
             .accounts

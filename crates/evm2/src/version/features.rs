@@ -232,6 +232,13 @@ evm_features! {
     ///
     /// Default: on since Amsterdam
     EIP2780,
+    /// Checks [EIP-4844](https://eips.ethereum.org/EIPS/eip-4844) blob fee caps against the block
+    /// blob base fee, independently of [`Self::BASE_FEE_CHECK`].
+    ///
+    /// Simulations may disable this check without changing blob fees or blob-list validation.
+    ///
+    /// Default: on since Cancun
+    BLOB_BASE_FEE_CHECK,
 }
 
 #[cfg(test)]

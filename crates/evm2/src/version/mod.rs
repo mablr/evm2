@@ -279,6 +279,7 @@ mod tests {
         assert!(osaka.feature(EvmFeatures::EIP7623));
         assert!(osaka.feature(EvmFeatures::EIP7702));
         assert!(osaka.feature(EvmFeatures::BASE_FEE_CHECK));
+        assert!(osaka.feature(EvmFeatures::BLOB_BASE_FEE_CHECK));
         assert!(osaka.feature(EvmFeatures::PRIORITY_FEE_CHECK));
         assert!(osaka.feature(EvmFeatures::FEE_CHARGE));
         assert!(!osaka.feature(EvmFeatures::EIP7708));
@@ -304,6 +305,8 @@ mod tests {
         assert_eq!(amsterdam.max_blobs_per_tx, MAX_BLOBS_PER_BLOCK_DENCUN);
 
         let cancun = Version::base(SpecId::CANCUN);
+        assert!(cancun.feature(EvmFeatures::BLOB_BASE_FEE_CHECK));
+        assert!(!Version::base(SpecId::SHANGHAI).feature(EvmFeatures::BLOB_BASE_FEE_CHECK));
         assert_eq!(cancun.max_blobs_per_tx, MAX_BLOBS_PER_BLOCK_DENCUN);
 
         let prague = Version::base(SpecId::PRAGUE);
@@ -717,6 +720,7 @@ evm_versions! {
     CANCUN {
         features: [
             EIP6780,
+            BLOB_BASE_FEE_CHECK,
         ],
         ops: [
             BLOBHASH: VERYLOW,

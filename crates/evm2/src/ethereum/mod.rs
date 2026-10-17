@@ -586,10 +586,9 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 charged_state_gas = new_account_state_gas;
             }
             // An empty recipient is never delegated, so the charge above and the resolution below
-            // are mutually exclusive.
-            if host.feature(EvmFeatures::EIP7702)
-                && let Some(delegated_address) = code.eip7702_address()
-            {
+            // are mutually exclusive. Existing delegation code resolves even before Prague;
+            // only authorization processing is fork-gated.
+            if let Some(delegated_address) = code.eip7702_address() {
                 if host.feature(EvmFeatures::EIP2780) {
                     // Delegation-target access, EIP-2929 warm/cold: charge the warm access first
                     // (covered → the target is loaded and enters the block access list), then the
@@ -949,6 +948,7 @@ mod tests {
     use alloc::vec;
     use alloy_consensus::{TxEip2930, transaction::Recovered};
     use alloy_eips::eip2930::AccessList;
+    use alloy_primitives::{address, hex};
 
     #[rstest::rstest]
     fn adjusted_floor_gas_controls_validation_and_settlement(
@@ -1390,6 +1390,97 @@ mod tests {
                 gas_limit: tx_gas_limit,
                 cap: amsterdam_without_eip8037.tx_gas_limit_cap,
             })
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(None, 41_023, 43_123)]
+    #[case(Some(op::CALL), 41_762, 48_362)]
+    #[case(Some(op::CALLCODE), 41_762, 48_362)]
+    #[case(Some(op::DELEGATECALL), 41_759, 48_359)]
+    #[case(Some(op::STATICCALL), 21_753, 26_253)]
+    fn existing_delegation_executes_before_prague(
+        #[values(SpecId::BYZANTIUM, SpecId::LONDON, SpecId::CANCUN, SpecId::PRAGUE)] spec: SpecId,
+        #[case] opcode: Option<u8>,
+        #[case] byzantium_gas: u64,
+        #[case] berlin_gas: u64,
+    ) {
+        let caller = Address::with_last_byte(0xaa);
+        let parent = Address::with_last_byte(0xbb);
+        let target = address!("11ef8dc52b32152f6dc7c894b45645d4a527b0d2");
+        let implementation = address!("5615deb798bb3e4dfa0139dfa1b3d433cc23b72f");
+        let mut code = vec![];
+        if opcode != Some(op::STATICCALL) {
+            // Write slot zero, except when testing a static call.
+            code.extend(hex!("602a600055"));
+        }
+        // Return ADDRESS to check execution context as well as code resolution.
+        code.extend(hex!("3060005260206000f3"));
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            &target,
+            AccountInfo::default().with_code(
+                Bytecode::new_raw_checked(
+                    hex!("ef01005615deb798bb3e4dfa0139dfa1b3d433cc23b72f").into(),
+                )
+                .unwrap(),
+            ),
+        );
+        db.insert_account_info(
+            &implementation,
+            AccountInfo::default().with_code(Bytecode::new_legacy(code.into())),
+        );
+        if let Some(opcode) = opcode {
+            let mut code = hex!("6020600060006000").to_vec();
+            if matches!(opcode, op::CALL | op::CALLCODE) {
+                code.extend([op::PUSH1, 0]);
+            }
+            code.push(op::PUSH20);
+            code.extend(target.as_slice());
+            code.extend([op::PUSH2, 0xff, 0xff, opcode]);
+            // Return the child's output and success flag.
+            code.extend(hex!("60205260406000f3"));
+            db.insert_account_info(
+                &parent,
+                AccountInfo::default().with_code(Bytecode::new_legacy(code.into())),
+            );
+        }
+        let mut evm = Evm::<BaseEvmTypes>::new(
+            spec,
+            BlockEnvExt::default(),
+            ethereum_tx_registry(spec),
+            db,
+            Precompiles::base(spec),
+        );
+        let tx = Recovered::new_unchecked(
+            TxEnvelope::Legacy(TxLegacy {
+                gas_limit: 150_000,
+                to: TxKind::Call(if opcode.is_some() { parent } else { target }),
+                ..Default::default()
+            }),
+            caller,
+        );
+        let result = evm.transact(&tx).unwrap().commit();
+        assert!(result.status, "{:?}", result.stop);
+        let destination =
+            if matches!(opcode, Some(op::CALLCODE | op::DELEGATECALL)) { parent } else { target };
+        let mut expected = destination.into_word().to_vec();
+        if opcode.is_some() {
+            expected.extend(U256::ONE.to_be_bytes::<32>());
+        }
+        assert_eq!(result.output.as_ref(), expected);
+        // Independently checked against revm 43.0.3, including pre-Berlin gas accounting.
+        assert_eq!(
+            result.tx_gas_used(),
+            if spec == SpecId::BYZANTIUM { byzantium_gas } else { berlin_gas }
+        );
+        assert_eq!(
+            evm.state_mut().storage_slot(&destination, U256::ZERO).unwrap().current(),
+            if opcode == Some(op::STATICCALL) { U256::ZERO } else { U256::from(42) },
+        );
+        assert_eq!(
+            evm.state_mut().storage_slot(&implementation, U256::ZERO).unwrap().current(),
+            U256::ZERO
         );
     }
 }

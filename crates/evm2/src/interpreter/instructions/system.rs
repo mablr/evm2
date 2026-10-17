@@ -96,9 +96,8 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     }
     let mut code = account.code;
     let mut code_address = to;
-    if state.feature(EvmFeatures::EIP7702)
-        && let Some(delegated_address) = code.eip7702_address()
-    {
+    // Existing delegation code resolves independently of authorization activation.
+    if let Some(delegated_address) = code.eip7702_address() {
         cost += u64::from(state.gas_params().get(GasId::WarmStorageReadCost));
         if cost > remaining_gas {
             return Err(InstrStop::OutOfGas);

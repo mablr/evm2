@@ -130,7 +130,7 @@ use crate::{
     trustme,
     version::{EvmFeatures, GasId},
 };
-use alloc::{boxed::Box, sync::Arc, vec};
+use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec};
 use alloy_consensus::transaction::Recovered;
 use alloy_eips::eip2718::Typed2718;
 use alloy_primitives::{Address, B256, Bytes, Log, LogData};
@@ -183,7 +183,7 @@ pub use state::{
     StorageSlot, StorageSlotHandle, Tee, Tracked,
 };
 
-mod prewarm_set;
+pub(crate) mod prewarm_set;
 pub use prewarm_set::PrewarmSet;
 
 /// Optional external interpreter runner.
@@ -747,8 +747,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     /// cannot express through [`Self::precompiles`] (it borrows all of `self`).
     #[inline]
     pub fn warm_precompiles(&mut self) {
-        let state = &mut self.state;
-        self.precompiles.for_each_address(&mut |address| state.prewarm(&address));
+        self.precompiles.warm_addresses(self.state.prewarm_set_mut());
     }
 
     /// Returns the precompile provider mutably.
@@ -809,11 +808,23 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         }
     }
 
-    /// Notifies the inspector and records an emitted log.
+    /// Returns whether emitted logs are observed: recorded in the transaction result
+    /// ([`EvmFeatures::LOG_COLLECTION`]) or passed to an inspector.
+    ///
+    /// Precompiles and handlers that emit logs should check this before building them.
+    #[inline]
+    pub const fn logs_observed(&self) -> bool {
+        self.feature(EvmFeatures::LOG_COLLECTION) || self.inspector.is_some()
+    }
+
+    /// Notifies the inspector and records an emitted log if [`EvmFeatures::LOG_COLLECTION`] is
+    /// enabled.
     #[inline]
     pub fn log(&mut self, log: Log) {
         self.inspect_log(&log);
-        self.state.log(log);
+        if self.feature(EvmFeatures::LOG_COLLECTION) {
+            self.state.log(log);
+        }
     }
 
     #[inline]
@@ -832,6 +843,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline(never)]
     fn log_eip7708_transfer(&mut self, from: &Address, to: &Address, value: &Word) {
         if self.feature(EvmFeatures::EIP7708)
+            && self.logs_observed()
             && let Some(log) = eip7708_transfer_log(from, to, value)
         {
             self.log(log);
@@ -1526,8 +1538,10 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         };
         let is_cold = account.warm();
 
-        let exists = account.exists();
-        let info = account.get().cloned().unwrap_or_default();
+        let (balance, nonce, code_hash, exists, is_empty) = match account.get() {
+            Some(info) => (info.balance, info.nonce, info.code_hash, true, info.is_empty()),
+            None => (Word::ZERO, 0, B256::ZERO, false, true),
+        };
 
         // load code
         let code = if load_code {
@@ -1536,12 +1550,12 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
             Bytecode::default()
         };
         Ok(AccountLoad {
-            balance: info.balance,
-            nonce: info.nonce,
-            code_hash: if exists { info.code_hash } else { B256::ZERO },
+            balance,
+            nonce,
+            code_hash,
             code,
             exists,
-            is_empty: info.is_empty(),
+            is_empty,
             is_cold,
             _non_exhaustive: (),
         })
@@ -1626,8 +1640,11 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         self.state.tstore(address, key, value);
     }
 
-    fn log(&mut self, log: Log) {
-        self.log(log);
+    #[inline]
+    fn log(&mut self, address: &Address, topics: Cow<'_, [B256]>, data: Cow<'_, [u8]>) {
+        if self.logs_observed() {
+            self.log(Log::new_unchecked(*address, topics.into_owned(), data.into_owned().into()));
+        }
     }
 
     #[inline]
@@ -2067,7 +2084,7 @@ mod tests {
             }),
             test_precompile(INNER_TEST_PRECOMPILE, |evm, message, _| {
                 let log = Log { address: INNER_TEST_PRECOMPILE, data: LogData::default() };
-                Host::log(evm, log.clone());
+                Host::log(evm, &INNER_TEST_PRECOMPILE, Cow::Borrowed(&[]), Cow::Borrowed(&[]));
                 evm.log(log);
                 if message.input.is_empty() {
                     Ok(PrecompileOutput::new(Bytes::new()))
@@ -2795,10 +2812,9 @@ mod tests {
         evm.set_inspector(ClearingInspector);
 
         match hook {
-            TopLevelInspectorHook::Log => Host::log(
-                &mut evm,
-                Log { address: Address::ZERO, data: LogData::new_unchecked(vec![], Bytes::new()) },
-            ),
+            TopLevelInspectorHook::Log => {
+                Host::log(&mut evm, &Address::ZERO, Cow::Borrowed(&[]), Cow::Borrowed(&[]))
+            }
             TopLevelInspectorHook::Call => {
                 let mut message = MessageExt { kind: MessageKind::Call, ..Default::default() };
                 let _ = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message);

@@ -166,6 +166,24 @@ pub struct StateInner<'a> {
     prewarm_set: PrewarmSet,
 }
 
+impl StateInner<'_> {
+    /// Appends a journal entry, building it straight in the journal's buffer.
+    ///
+    /// `Vec::push` builds the entry on the stack, because it must survive a possible reallocation,
+    /// and then copies it with wide loads. Those loads cannot take their data from the narrower
+    /// stores that built the entry and stall until the stores reach the cache.
+    #[inline(always)]
+    fn push_journal(&mut self, entry: impl FnOnce() -> JournalEntry) {
+        self.journal.reserve(1);
+        let len = self.journal.len();
+        // SAFETY: `reserve` made room for one more entry.
+        unsafe {
+            self.journal.as_mut_ptr().add(len).write(entry());
+            self.journal.set_len(len + 1);
+        }
+    }
+}
+
 impl<'a> State<'a> {
     /// Creates a new state over an initial database.
     pub fn new(initial: impl DynDatabase + 'a) -> Self {
@@ -417,6 +435,20 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Sets the warmth of an already-loaded account without journaling the change.
+    ///
+    /// Does nothing for unloaded accounts and leaves account values, storage, and the pre-warmed
+    /// set unchanged. Addresses in the pre-warmed set remain effectively warm even when their
+    /// runtime warmth is cleared.
+    ///
+    /// This call adds no journal entry; rolling back an existing account-change entry still
+    /// restores the account's recorded runtime warmth.
+    pub fn set_account_warm(&mut self, address: &Address, warm: bool) {
+        if let Some(account) = self.accounts.get_mut(address) {
+            account.is_warm = warm;
+        }
+    }
+
     /// Reads a storage slot from the committed state (accepted overlay and backing database),
     /// ignoring the in-flight transaction overlay.
     #[inline]
@@ -452,6 +484,12 @@ impl<'a> State<'a> {
     /// if loaded accesses should retain only the replacement set's warmth.
     pub fn set_prewarm_set(&mut self, prewarm_set: PrewarmSet) {
         self.inner.prewarm_set = prewarm_set;
+    }
+
+    /// Returns the pre-warmed set mutably.
+    #[inline]
+    pub(crate) const fn prewarm_set_mut(&mut self) -> &mut PrewarmSet {
+        &mut self.inner.prewarm_set
     }
 
     /// Marks an address as warm in the pre-warmed set. See [`PrewarmSet::warm`].
@@ -584,23 +622,24 @@ impl<'a> State<'a> {
     ///
     /// Loading account metadata neither touches nor warms the account. Slot values remain lazy;
     /// loading or warming a slot records the same journal entries as [`AccountHandle::storage`].
-    pub fn storage(&mut self, address: &Address) -> DbResult<StorageHandle<'_, 'a>> {
+    #[inline(always)]
+    pub fn storage<'s>(&'s mut self, address: &'s Address) -> DbResult<StorageHandle<'s, 'a>> {
         let State { accounts, storage_pool, inner, .. } = self;
         let account = Self::account_raw(inner, accounts, address)?;
         if account.storage.slots.capacity() == 0 {
             account.storage.slots = storage_pool.take();
         }
-        Ok(StorageHandle::new(*address, &mut account.storage, inner))
+        Ok(StorageHandle::new(address, &mut account.storage, inner))
     }
 
     /// Loads a single persistent storage slot and returns a journaled mutation handle.
     ///
     /// Cold slots are always loaded. See [`StorageHandle::into_slot`] for loading semantics.
-    pub fn storage_slot(
-        &mut self,
-        address: &Address,
+    pub fn storage_slot<'s>(
+        &'s mut self,
+        address: &'s Address,
         key: Word,
-    ) -> DbResult<StorageSlotHandle<'_, 'a>> {
+    ) -> DbResult<StorageSlotHandle<'s, 'a>> {
         self.storage(address)?.into_slot(key)
     }
 
@@ -734,7 +773,7 @@ impl<'a> State<'a> {
                 if previous == *value {
                     return;
                 }
-                self.inner.journal.push(JournalEntry::TransientStorageChange {
+                self.inner.push_journal(|| JournalEntry::TransientStorageChange {
                     address: *address,
                     key: *key,
                     previous: Some(previous),
@@ -749,7 +788,7 @@ impl<'a> State<'a> {
                 if value.is_zero() {
                     return;
                 }
-                self.inner.journal.push(JournalEntry::TransientStorageChange {
+                self.inner.push_journal(|| JournalEntry::TransientStorageChange {
                     address: *address,
                     key: *key,
                     previous: None,
@@ -1170,6 +1209,37 @@ mod tests {
             state.set_storage_warm(&address, key, false);
             state.set_storage_warm(&address, key, true);
             assert!(!state.storage_slot(&address, key).unwrap().warm());
+        }
+    }
+
+    #[test]
+    fn set_account_warm_preserves_loaded_values() {
+        let address = Address::with_last_byte(42);
+        let key = Word::from(1);
+        for prewarmed in [false, true] {
+            let mut state = State::new(EmptyDB::default());
+            state.set_account_warm(&address, true);
+            assert!(!state.accounts.contains_key(&address));
+            if prewarmed {
+                state.prewarm(&address);
+            }
+            let mut account = state.account(&address).unwrap();
+            account.set_balance(Word::from(7));
+            account.warm();
+            drop(account);
+            state.storage_slot(&address, key).unwrap().warm();
+            let checkpoint = state.checkpoint();
+            state.set_account_warm(&address, false);
+            assert_eq!(state.account(&address).unwrap().is_warm(), prewarmed);
+            assert!(state.storage(&address).unwrap().is_warm(&key));
+            state.rollback(checkpoint, crate::EvmFeatures::empty());
+            let mut account = state.account(&address).unwrap();
+            assert_eq!(account.balance(), Word::from(7));
+            assert_eq!(account.warm(), !prewarmed);
+            drop(account);
+            state.set_account_warm(&address, false);
+            state.set_account_warm(&address, true);
+            assert!(!state.account(&address).unwrap().warm());
         }
     }
 

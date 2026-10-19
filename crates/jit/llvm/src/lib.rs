@@ -1978,7 +1978,12 @@ impl Builder for EvmLlvmBuilder<'_> {
 
 /// Builds the LLVM pass pipeline string. See [`EvmLlvmBackend::optimize_module`].
 fn build_pass_pipeline(with_licm: bool) -> String {
-    let mut passes = String::from("module(globalopt,cgscc(inline),globalopt,function(");
+    // `globalopt`, `cgscc(inline)`, a second `sroa`, and `adce` change no benchmark's
+    // assembly, so they are left out: the module has no global data, its only internal
+    // function (the `mresize` stub) is `noinline`, the first `sroa` promotes the one
+    // `alloca`, and `dse`/`simplifycfg` remove what `adce` would. Revisit them when
+    // codegen emits inlinable helper functions or global data.
+    let mut passes = String::from("module(function(");
     let function_passes: &[&str] = &[
         "simplifycfg",
         "sroa",
@@ -1990,15 +1995,8 @@ fn build_pass_pipeline(with_licm: bool) -> String {
     ];
     let licm_passes: &[&str] =
         &["loop-mssa(licm,loop-rotate,licm)", "simplifycfg", "instcombine<no-verify-fixpoint>"];
-    let post_passes: &[&str] = &[
-        "sroa",
-        "early-cse",
-        "sccp",
-        "instcombine<no-verify-fixpoint>",
-        "adce",
-        "dse",
-        "simplifycfg",
-    ];
+    let post_passes: &[&str] =
+        &["early-cse", "sccp", "instcombine<no-verify-fixpoint>", "dse", "simplifycfg"];
 
     let iter =
         function_passes.iter().chain(if with_licm { licm_passes } else { &[] }).chain(post_passes);
@@ -2065,6 +2063,24 @@ fn init_() -> Result<()> {
         // conditional branches instead. The flag applies to every `select`, but the IR has few
         // others.
         c"-disable-cgp-select2branch".as_ptr(),
+        // A JUMPDEST that dominates the rest of the code and is reached again through the
+        // dynamic jump table or an internal function's return switch heads a loop that spans
+        // most of the function. MachineLICM hoists every constant materialization in it, often
+        // hundreds of constant pool loads, into the preheader, and greedy register allocation
+        // then spends most of codegen splitting those function-wide live ranges. Sink them back
+        // into their users when the preheader's register pressure exceeds the limit: this cut
+        // codegen by up to 15x on large mainnet contracts.
+        c"-sink-insts-to-avoid-spills".as_ptr(),
+        // PHI elimination splits critical edges to put each phi copy on its own edge. The dynamic
+        // jump table and internal-function return switches have many critical edges into blocks
+        // with phis, and the new blocks and jumps give greedy register allocation more places to
+        // split live ranges and reload. Keeping the copies in the predecessors cut reloads by 12%
+        // on the mainnet corpus.
+        c"-disable-phi-elim-edge-splitting".as_ptr(),
+        // These change little or no code on the benchmarks and the mainnet corpus but still walk
+        // every machine instruction.
+        c"-disable-x86-domain-reassignment".as_ptr(),
+        c"-disable-postra-machine-licm".as_ptr(),
     ];
     args.extend(extra.iter().map(|s| s.as_ptr()));
     unsafe {

@@ -1,20 +1,25 @@
 //! Owned pending transaction state detached from the EVM.
 
 use super::{
-    Account, AccountChanges, AccountInfo, StateChangeSink, StateChangeSource, StorageSlot, Tracked,
+    Account, AccountChanges, AccountInfo, StateChangeSink, StateChangeSource, StorageOverlay,
+    StorageSlot, Tracked,
 };
-use crate::interpreter::Word;
+use crate::{
+    evm::{DbResult, DynDatabase},
+    interpreter::Word,
+};
 use alloy_primitives::{
     Address,
     map::{AddressMap, AddressSet},
 };
 
-/// A transaction's finalized-but-uncommitted state, moved out of the EVM.
+/// A transaction's loaded state, moved out of the EVM without committing it.
 ///
-/// Produced by [`ExecutedTx::detach`](crate::ExecutedTx::detach), this is the transaction overlay
-/// exactly as execution left it: every account and storage slot loaded during the transaction,
-/// each carrying its transaction-boundary original value next to its present value. Two consumers
-/// draw from it:
+/// Produced by [`State::take_pending_state`](super::State::take_pending_state), or after
+/// finalization by [`ExecutedTx::detach`](crate::ExecutedTx::detach), this is the transaction
+/// overlay exactly as execution left it: every account and storage slot loaded during the
+/// transaction, each carrying its transaction-boundary original value next to its present value.
+/// Two consumers draw from it:
 ///
 /// - [`Bal::commit`](crate::evm::Bal::commit) folds it into an EIP-7928 Block Access List,
 ///   recording loaded-but-unchanged entries as reads and changed ones as writes — the same fold the
@@ -103,6 +108,66 @@ impl PendingState {
             account.changes(address, self.selfdestructs.contains(&address))
         })
     }
+
+    /// Copies a loaded account from another transaction layer without journaling it.
+    ///
+    /// Source account metadata and slots win, while target-only slots are retained unless the
+    /// source wiped storage. Originals, warmth and lifecycle flags are copied with their values.
+    /// An account the source did not load leaves the target unchanged.
+    pub fn merge_account(&mut self, source: &Self, address: &Address) {
+        let Some(mut account) = source.accounts.get(address).cloned() else { return };
+        if !account.storage.wiped
+            && let Some(target) = self.accounts.get(address)
+        {
+            for (key, slot) in &target.storage.slots {
+                account.storage.slots.entry(*key).or_insert(*slot);
+            }
+        }
+        self.accounts.insert(*address, account);
+        if source.selfdestructs.contains(address) {
+            self.selfdestructs.insert(*address);
+        } else {
+            self.selfdestructs.remove(address);
+        }
+    }
+
+    /// Refreshes loaded values after an external transaction, preserving originals and lifecycle
+    /// flags.
+    ///
+    /// The database must already include this overlay's writes and the external transaction.
+    /// Reattaching the refreshed overlay requires a backing cache consistent with its retained
+    /// originals, not the external transaction's current values. Stage the overlay first if
+    /// database errors must not publish partial updates.
+    pub fn refresh(&mut self, database: &mut impl DynDatabase) -> DbResult<()> {
+        for (address, account) in &mut self.accounts {
+            let mut current = database.get_account(address)?;
+            if let Some(current) = &mut current
+                && let Some(previous) = &account.present
+                && current.code_hash == previous.code_hash
+            {
+                current.code = previous.code.clone();
+            }
+            account.code_changed = account.original.as_ref().map(|info| info.code_hash)
+                != current.as_ref().map(|info| info.code_hash);
+            if account.code_changed
+                && let Some(current) = &mut current
+            {
+                current.code = Some(database.get_code_by_hash(&current.code_hash)?);
+            }
+            account.present = current;
+            for (key, slot) in &mut account.storage.slots {
+                slot.value.current = database.get_storage(address, key)?;
+            }
+            // The database already contains the wipe and any newly written slots.
+            account.storage.wiped = false;
+        }
+        Ok(())
+    }
+
+    /// Returns a loaded account's storage for non-journaled updates to a detached overlay.
+    pub fn storage_mut(&mut self, address: &Address) -> Option<&mut StorageOverlay> {
+        self.accounts.get_mut(address).map(|account| &mut account.storage)
+    }
 }
 
 impl StateChangeSource for PendingState {
@@ -126,6 +191,10 @@ impl StateChangeSource for PendingState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        EvmFeatures, SpecId, Version,
+        evm::{EmptyDB, State},
+    };
 
     #[test]
     fn inserts_account_and_storage() {
@@ -145,5 +214,43 @@ mod tests {
             state.accounts[&address].storage.slots[&key].value,
             Tracked::from_parts(Word::from(2), Word::from(3))
         );
+    }
+
+    #[test]
+    fn merging_loaded_accounts_preserves_slots_and_lifecycle() {
+        let address = Address::with_last_byte(0xaa);
+        let mut source = State::new(EmptyDB::default());
+        source
+            .create_account(&address, &address, &Word::ZERO, EvmFeatures::EIP161)
+            .unwrap()
+            .unwrap();
+        source.storage_slot(&address, Word::ONE).unwrap().set(Word::from(23));
+        let pending = source.take_pending_state();
+        let mut target = State::new(EmptyDB::default());
+        target.storage_slot(&address, Word::ONE).unwrap().set(Word::from(91));
+        target.storage_slot(&address, Word::from(2)).unwrap().set(Word::from(47));
+        target.account(&address).unwrap().mark_destructed();
+        let mut merged = target.take_pending_state();
+        merged.merge_account(&pending, &address);
+        let mut resumed = State::new(EmptyDB::default());
+        resumed.set_pending_state(merged);
+        assert!(resumed.journal().is_empty());
+        assert!(resumed.account(&address).unwrap().is_created());
+        assert!(!resumed.account(&address).unwrap().is_destructed());
+        assert_eq!(resumed.storage_slot_untracked(&address, &Word::ONE).unwrap(), Word::from(23));
+        assert_eq!(
+            resumed.storage_slot_untracked(&address, &Word::from(2)).unwrap(),
+            Word::from(47)
+        );
+
+        source.set_pending_state(pending);
+        source.storage(&address).unwrap().wipe();
+        source.account(&address).unwrap().mark_destructed();
+        let mut merged = resumed.take_pending_state();
+        merged.merge_account(&source.take_pending_state(), &address);
+        resumed.set_pending_state(merged);
+        assert_eq!(resumed.storage_slot_untracked(&address, &Word::from(2)).unwrap(), Word::ZERO);
+        resumed.finalize_transaction(Version::base(SpecId::PRAGUE)).unwrap();
+        assert!(resumed.account_info_untracked(&address).unwrap().is_none());
     }
 }

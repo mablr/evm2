@@ -264,6 +264,7 @@ impl Account {
             address,
             original: self.original.as_ref(),
             current: self.present.as_ref(),
+            touched: self.is_touched,
             created: self.is_created(),
             selfdestructed,
             code: self.changed_code(),
@@ -464,7 +465,10 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
             return Ok(code.clone());
         }
         let code_hash = account.code_hash;
-        self.inner.database.get_code_by_hash(&code_hash)
+        let code = self.inner.database.get_code_by_hash(&code_hash)?;
+        // Code is read-cache data, not a journaled account change.
+        self.tracked.present.as_mut().expect("account exists").code = Some(code.clone());
+        Ok(code)
     }
 
     /// Loads the account's bytecode as it stood at the start of the transaction.

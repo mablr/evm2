@@ -39,6 +39,8 @@ pub struct AccountChanges<'a> {
     pub original: Option<&'a AccountInfo>,
     /// Account after the transaction. `None` means the account does not exist.
     pub current: Option<&'a AccountInfo>,
+    /// Whether execution touched the account, even if its values did not change.
+    pub touched: bool,
     /// Whether the account was created during the transaction.
     pub created: bool,
     /// Whether the account was selfdestructed during the transaction.

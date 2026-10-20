@@ -940,13 +940,12 @@ impl<'a> State<'a> {
             self.storage(address)?.wipe();
         }
 
-        // Finalization never touches accounts, so clearing touches in the same pass that selects
-        // the touched accounts to finalize sees the same set. Only those accounts need another
-        // lookup, and they are rare.
+        // Retain touches in the returned transaction state, including touched-but-unchanged
+        // accounts. Commit or discard clears them with the rest of the transaction layer.
         let eip161 = version.feature(EvmFeatures::EIP161);
         let mut finalize = Vec::new();
-        for (&address, entry) in &mut self.accounts {
-            if !mem::take(&mut entry.is_touched) {
+        for (&address, entry) in &self.accounts {
+            if !entry.is_touched {
                 continue;
             }
             // EIP-161 deletes touched dead accounts at transaction finalization. Before EIP-161,
@@ -995,7 +994,7 @@ impl<'a> State<'a> {
     ///
     /// This borrows the transaction layer without detaching it.
     #[inline]
-    pub(crate) fn transaction_account_changes(&self) -> impl Iterator<Item = AccountChanges<'_>> {
+    pub fn transaction_account_changes(&self) -> impl Iterator<Item = AccountChanges<'_>> {
         self.accounts.iter().map(|(&address, account)| {
             account.changes(address, self.selfdestructs.contains(&address))
         })
@@ -1003,9 +1002,11 @@ impl<'a> State<'a> {
 
     /// Detaches the transaction overlay into an owned [`PendingState`].
     ///
+    /// This does not finalize or commit the state. A suspended transaction can resume its loaded
+    /// accounts, storage and lifecycle flags with [`Self::set_pending_state`].
     /// The remaining transaction scratch (journal, logs, warm sets, transient storage) is left for
     /// [`Self::clear_transaction_state`].
-    pub(crate) fn take_pending_state(&mut self) -> PendingState {
+    pub fn take_pending_state(&mut self) -> PendingState {
         PendingState {
             accounts: mem::take(&mut self.accounts),
             selfdestructs: mem::take(&mut self.inner.selfdestructs),
@@ -1061,11 +1062,9 @@ impl<'a> State<'a> {
 
     /// Reattaches a detached [`PendingState`] as the current transaction overlay, replacing it.
     ///
-    /// This is the inverse of the detach performed by
-    /// [`ExecutedTx::detach`](crate::ExecutedTx::detach): the pending accounts, storage, and
-    /// selfdestruct set become the transaction layer again, as if the transaction had just been
-    /// finalized. Other transaction scratch (journal, logs, warm sets, transient storage) is not
-    /// affected.
+    /// This is the inverse of [`Self::take_pending_state`]: the pending accounts, storage, and
+    /// selfdestruct set become the transaction layer again, preserving their lifecycle flags.
+    /// Other transaction scratch (journal, logs, warm sets, transient storage) is not affected.
     pub fn set_pending_state(&mut self, pending: PendingState) {
         for account in self.accounts.values_mut() {
             self.storage_pool.clear_overlay(&mut account.storage);
@@ -1088,6 +1087,13 @@ impl<'a> State<'a> {
         }
         self.accounts.clear();
         self.inner.selfdestructs.clear();
+    }
+
+    /// Returns a loaded account and its storage without loading it or changing transaction state.
+    pub fn get_account_changes(&self, address: &Address) -> Option<AccountChanges<'_>> {
+        self.accounts
+            .get(address)
+            .map(|account| account.changes(*address, self.selfdestructs.contains(address)))
     }
 }
 

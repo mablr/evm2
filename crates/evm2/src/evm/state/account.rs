@@ -2,6 +2,7 @@
 
 use super::{
     AccountChanges, DbResult, DynDatabase, JournalEntry, StateInner, StorageHandle, StorageOverlay,
+    journal::{AccountFields, AccountUndo},
     storage_pool::StoragePool,
 };
 use crate::{EvmFeatures, bytecode::Bytecode, interpreter::Word};
@@ -202,8 +203,14 @@ impl Account {
     }
 
     /// Applies isolated execution changes, retaining parent originals and account warmth.
-    #[cfg(test)]
-    pub(crate) fn merge_isolated(&mut self, child: Self) {
+    pub(crate) fn merge_isolated(&mut self, mut child: Self) {
+        if let Some(parent) = &mut self.present
+            && let Some(info) = &mut child.present
+            && info.code.is_none()
+            && info.code_hash == parent.code_hash
+        {
+            info.code = parent.code.take();
+        }
         self.present = child.present;
         self.is_touched |= child.is_touched;
         self.is_destroyed |= child.is_destroyed;
@@ -282,8 +289,9 @@ impl Account {
 /// The first mutation made through the handle captures a snapshot of the overlay entry (present
 /// value plus the warm/touched/destroyed/created/code-changed flags); on drop the handle flushes
 /// that snapshot as a single [`JournalEntry::AccountChange`], which
-/// [`State::rollback`](super::State::rollback) replays to restore the whole entry at once. A handle
-/// used only for reads records nothing, so it emits no journal entry.
+/// [`State::rollback`](super::State::rollback) applies only to the fields this handle changed.
+/// Relative balance changes and nonce bumps retain their inverse operations, so unrelated host
+/// writes survive rollback. A handle used only for reads emits no journal entry.
 ///
 /// The handle also carries the shared [`StateInner`] (backing database, revert journal, and
 /// transaction-initial base warm set), so it can journal mutations, load code on demand, and answer
@@ -345,10 +353,10 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     }
 
     /// Records the pre-mutation revert entry the first time a change is made through this handle.
-    /// Subsequent calls are no-ops, so the whole handle session flushes a single
+    /// Subsequent calls accumulate the changed fields, so the whole handle session flushes a single
     /// [`JournalEntry::AccountChange`] on drop.
     #[inline]
-    fn record_change(&mut self) {
+    fn record_change(&mut self, fields: AccountFields) -> &mut AccountUndo {
         if self.snapshot.is_none() {
             self.snapshot = Some(JournalEntry::AccountChange {
                 address: self.address,
@@ -358,8 +366,14 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
                 previous_is_destroyed: self.tracked.is_destroyed,
                 previous_just_created: self.tracked.just_created,
                 previous_code_changed: self.tracked.code_changed,
+                undo: AccountUndo::default(),
             });
         }
+        let Some(JournalEntry::AccountChange { undo, .. }) = &mut self.snapshot else {
+            unreachable!("account handles only record account changes")
+        };
+        undo.fields |= fields;
+        undo
     }
 
     /// Returns the account address.
@@ -497,7 +511,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     #[inline]
     pub fn touch(&mut self) {
         if !self.tracked.is_touched {
-            self.record_change();
+            self.record_change(AccountFields::TOUCHED);
             self.tracked.is_touched = true;
         }
     }
@@ -510,7 +524,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     #[inline]
     pub fn mark_destructed(&mut self) {
         if !self.tracked.is_destroyed {
-            self.record_change();
+            self.record_change(AccountFields::DESTROYED);
             self.tracked.is_destroyed = true;
             self.inner.selfdestructs.insert(self.address);
         }
@@ -527,7 +541,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         if self.tracked.is_warm || self.inner.prewarm_set.is_warm(&self.address) {
             return false;
         }
-        self.record_change();
+        self.record_change(AccountFields::WARM);
         self.tracked.is_warm = true;
         true
     }
@@ -536,7 +550,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     #[inline]
     pub fn set_balance(&mut self, balance: Word) {
         self.touch();
-        self.present_mut().balance = balance;
+        self.present_mut(AccountFields::BALANCE).balance = balance;
     }
 
     /// Adds a signed balance delta by wrapping two's-complement values, touching the account.
@@ -548,15 +562,18 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
             self.touch();
             return;
         }
-        let balance = self.balance().wrapping_add(delta);
-        self.set_balance(balance);
+        self.touch();
+        let undo = self.record_change(AccountFields::empty());
+        undo.balance_delta = undo.balance_delta.wrapping_add(delta);
+        let account = self.tracked.present.get_or_insert_with(empty_account);
+        account.balance = account.balance.wrapping_add(delta);
     }
 
     /// Sets the account nonce, touching the account and recording a revert snapshot.
     #[inline]
     pub fn set_nonce(&mut self, nonce: u64) {
         self.touch();
-        self.present_mut().nonce = nonce;
+        self.present_mut(AccountFields::NONCE).nonce = nonce;
     }
 
     /// Bumps the account nonce by one, touching the account and recording a revert snapshot.
@@ -568,7 +585,8 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         let Some(nonce) = self.nonce().checked_add(1) else {
             return false;
         };
-        self.present_mut().nonce = nonce;
+        self.record_change(AccountFields::empty()).nonce_bumps += 1;
+        self.tracked.present.get_or_insert_with(empty_account).nonce = nonce;
         true
     }
 
@@ -579,7 +597,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     #[inline]
     pub fn set_code(&mut self, code_hash: B256, code: Bytecode) {
         self.touch();
-        let account = self.present_mut();
+        let account = self.present_mut(AccountFields::CODE);
         account.code_hash = code_hash;
         account.code = Some(code);
         self.tracked.code_changed = true;
@@ -611,8 +629,8 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     /// Records a revert snapshot and returns the live account, materializing an empty one when it
     /// is currently absent.
     #[inline]
-    fn present_mut(&mut self) -> &mut AccountInfo {
-        self.record_change();
+    fn present_mut(&mut self, fields: AccountFields) -> &mut AccountInfo {
+        self.record_change(fields);
         self.tracked.present.get_or_insert_with(empty_account)
     }
 
@@ -621,7 +639,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     /// overlay by the [`JournalEntry::AccountChange`] snapshot recorded for this handle.
     #[inline]
     pub(crate) fn mark_created(&mut self) {
-        self.record_change();
+        self.record_change(AccountFields::CREATED);
         self.tracked.mark_created();
     }
 
@@ -629,14 +647,14 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     /// is currently absent.
     #[inline]
     pub fn get_or_insert(&mut self) -> &mut AccountInfo {
-        self.present_mut()
+        self.present_mut(AccountFields::INFO)
     }
 
     /// Updates the account payload, touching the account and recording a revert snapshot.
     #[cfg(feature = "account-ext")]
     pub fn set_extension(&mut self, extension: super::AccountExtension) {
         self.touch();
-        self.present_mut().extension = extension;
+        self.present_mut(AccountFields::EXTENSION).extension = extension;
     }
 
     /// Deletes the account at transaction finalization.
@@ -670,7 +688,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     /// Earlier handles' journal entries remain unchanged and can still restore older values.
     #[inline]
     pub fn override_balance(&mut self, balance: Word) {
-        self.present_mut().balance = balance;
+        self.present_mut(AccountFields::BALANCE).balance = balance;
         if let Some(JournalEntry::AccountChange { previous, .. }) = &mut self.snapshot {
             previous.get_or_insert_with(empty_account).balance = balance;
         }
@@ -682,10 +700,21 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     /// Earlier handles' journal entries remain unchanged and can still restore older values.
     #[inline]
     pub fn override_nonce(&mut self, nonce: u64) {
-        self.present_mut().nonce = nonce;
+        self.present_mut(AccountFields::NONCE).nonce = nonce;
         if let Some(JournalEntry::AccountChange { previous, .. }) = &mut self.snapshot {
             previous.get_or_insert_with(empty_account).nonce = nonce;
         }
+    }
+
+    /// Returns the live account for host writes that do not add undo operations.
+    ///
+    /// Earlier ordinary undo operations still apply to these values on rollback. Flush this
+    /// handle's pending changes first so later journaled writes capture the overridden values.
+    pub fn get_or_insert_untracked(&mut self) -> &mut AccountInfo {
+        if let Some(entry) = self.snapshot.take() {
+            self.inner.journal.push(entry);
+        }
+        self.tracked.present.get_or_insert_with(empty_account)
     }
 }
 
@@ -955,5 +984,41 @@ mod tests {
         }
         state.rollback(parent, features);
         assert_eq!(state.account(&address).unwrap().get(), Some(&original));
+    }
+
+    #[test]
+    fn untracked_writes_preserve_ordinary_undo() {
+        let sender = Address::with_last_byte(0x93);
+        let target = Address::with_last_byte(0x94);
+        for bump in [false, true] {
+            let mut db = CacheDB::default();
+            db.insert_account_info(&sender, AccountInfo::default().with_balance(Word::from(100)));
+            db.insert_account_info(
+                &target,
+                AccountInfo::default().with_balance(Word::from(50)).with_nonce(1),
+            );
+            let mut state = State::new(db);
+            let checkpoint = state.checkpoint();
+            state.account(&target).unwrap().warm();
+            assert!(state.transfer(&sender, &target, &Word::from(10)).unwrap());
+            {
+                let mut account = state.account(&target).unwrap();
+                if bump {
+                    assert!(account.bump_nonce());
+                } else {
+                    account.set_nonce(2);
+                }
+                let info = account.get_or_insert_untracked();
+                info.balance = Word::from(100);
+                info.nonce = 0;
+                account.get_or_insert_untracked().nonce = 7;
+            }
+            state.rollback(checkpoint, crate::Version::base(crate::SpecId::CANCUN).features);
+            assert_eq!(state.account(&sender).unwrap().balance(), Word::from(100));
+            let account = state.account(&target).unwrap();
+            assert_eq!(account.balance(), Word::from(90));
+            assert_eq!(account.nonce(), if bump { 6 } else { 1 });
+            assert!(!account.is_warm());
+        }
     }
 }

@@ -24,7 +24,6 @@ pub struct StorageOverlay {
 
 impl StorageOverlay {
     /// Applies an isolated execution's slots, retaining parent originals and combining warmth.
-    #[cfg(test)]
     pub(crate) fn merge_isolated(&mut self, child: Self) {
         self.wiped |= child.wiped;
         for (key, slot) in child.slots {

@@ -16,7 +16,7 @@ pub use account::{AccountHandle, AccountInfo};
 pub use block::BlockStateAccumulator;
 #[cfg(feature = "account-ext")]
 pub use extension::AccountExtension;
-pub use journal::{JournalEntry, StateCheckpoint};
+pub use journal::{AccountUndo, JournalEntry, StateCheckpoint};
 pub use pending::PendingState;
 pub use storage::{StorageHandle, StorageOverlay, StorageSlot, StorageSlotHandle};
 pub use stream::{
@@ -32,7 +32,6 @@ use super::{
 };
 use crate::{
     EvmFeatures, LoadError, Version,
-    bytecode::Bytecode,
     interpreter::{InstrStop, Word},
     storage_key::{StorageKey, StorageKeyMap},
 };
@@ -46,6 +45,7 @@ use core::{
     ops::{Deref, DerefMut},
 };
 use derive_where::derive_where;
+use journal::AccountFields;
 
 /// Mutable EVM state with an accepted-state cache, transaction layer, and reversible journal.
 #[derive(Debug)]
@@ -126,6 +126,22 @@ impl State<'_> {
     /// Clones in-memory state with `db` as the backing database.
     pub fn clone_with<'a>(&self, db: impl DynDatabase + 'a) -> State<'a> {
         self.snapshot().into_state(db)
+    }
+
+    /// Replaces the running state, retaining the displaced state for enclosing frame rollback.
+    ///
+    /// The current journal and logs are retained, keeping live checkpoints valid. Rolling back
+    /// reinstates displaced transaction values before earlier ordinary undo, but does not undo
+    /// the restored backing database or accepted cache.
+    pub fn replace_state(&mut self, mut replacement: Self) {
+        replacement.inner.journal = mem::take(&mut self.inner.journal);
+        replacement.inner.logs = mem::take(&mut self.inner.logs);
+        replacement.inner.journal.push(JournalEntry::StateReplaced {
+            state: Box::new(self.take_pending_state()),
+            transient_storage: mem::take(&mut self.transient_storage),
+            prewarm_set: mem::take(&mut self.inner.prewarm_set),
+        });
+        *self = replacement;
     }
 }
 
@@ -694,18 +710,15 @@ impl<'a> State<'a> {
 
         {
             let mut from_account = self.account(from)?;
-            let Some(new_from_balance) = from_account.balance().checked_sub(*value) else {
+            if from_account.balance() < *value {
                 return Ok(false);
-            };
-            // `set_balance` touches the account, matching the touch the prior `transfer` performed.
-            from_account.set_balance(new_from_balance);
-            from_account.touch();
+            }
+            from_account.add_balance(Word::ZERO.wrapping_sub(*value));
         }
         {
             let mut to_account = self.account(to)?;
             let new_to_balance = to_account.balance().saturating_add(*value);
-            to_account.set_balance(new_to_balance);
-            to_account.touch();
+            to_account.add_balance(new_to_balance - to_account.balance());
         }
         Ok(true)
     }
@@ -733,27 +746,17 @@ impl<'a> State<'a> {
         // caller untouched, matching the prior `transfer` behaviour.
         if !value.is_zero() {
             let mut caller_account = self.account(caller)?;
-            let Some(new_caller_balance) = caller_account.balance().checked_sub(*value) else {
+            if caller_account.balance() < *value {
                 return Ok(Err(InstrStop::OutOfFunds));
-            };
-            caller_account.set_balance(new_caller_balance);
+            }
+            caller_account.add_balance(Word::ZERO.wrapping_sub(*value));
         }
 
         let mut target = self.account(address)?;
         // Preserve any balance the address already held (e.g. funds sent before creation) and add
         // the endowment.
-        let balance = target.balance().wrapping_add(*value);
-        #[cfg(feature = "account-ext")]
-        let extension = target.get().map(|info| info.extension.clone()).unwrap_or_default();
-        *target.get_or_insert() = AccountInfo {
-            nonce: u64::from(features.contains(EvmFeatures::EIP161)),
-            balance,
-            code_hash: KECCAK256_EMPTY,
-            code: Some(Bytecode::default()),
-            _non_exhaustive: (),
-            #[cfg(feature = "account-ext")]
-            extension,
-        };
+        target.add_balance(*value);
+        target.set_nonce(u64::from(features.contains(EvmFeatures::EIP161)));
         target.mark_created();
         target.touch();
         Ok(Ok(()))
@@ -839,27 +842,62 @@ impl<'a> State<'a> {
                     previous_is_destroyed,
                     previous_just_created,
                     previous_code_changed,
+                    undo,
                 } => {
                     // Reconcile the self-destruct set with the restored destroyed flag.
                     let was_destroyed =
                         self.accounts.get(&address).is_some_and(|entry| entry.is_destroyed);
-                    if was_destroyed && !previous_is_destroyed {
-                        self.selfdestructs.remove(&address);
-                    } else if !was_destroyed && previous_is_destroyed {
-                        self.selfdestructs.insert(address);
+                    if undo.fields.contains(AccountFields::DESTROYED) {
+                        if was_destroyed && !previous_is_destroyed {
+                            self.selfdestructs.remove(&address);
+                        } else if !was_destroyed && previous_is_destroyed {
+                            self.selfdestructs.insert(address);
+                        }
                     }
                     if let Some(entry) = self.accounts.get_mut(&address) {
-                        entry.present = previous;
-                        entry.is_warm = previous_is_warm;
+                        let was_absent = previous.is_none();
+                        let previous = previous.unwrap_or_default();
+                        let current = entry.present.get_or_insert_with(AccountInfo::default);
+                        if undo.fields.contains(AccountFields::BALANCE) {
+                            current.balance = previous.balance;
+                        } else {
+                            current.balance = current.balance.wrapping_sub(undo.balance_delta);
+                        }
+                        if undo.fields.contains(AccountFields::NONCE) {
+                            current.nonce = previous.nonce;
+                        } else {
+                            current.nonce = current.nonce.saturating_sub(undo.nonce_bumps);
+                        }
+                        if undo.fields.contains(AccountFields::CODE) {
+                            current.code_hash = previous.code_hash;
+                            current.code = previous.code;
+                        }
+                        #[cfg(feature = "account-ext")]
+                        if undo.fields.contains(AccountFields::EXTENSION) {
+                            current.extension = previous.extension;
+                        }
+                        if was_absent && *current == AccountInfo::default() {
+                            entry.present = None;
+                        }
+                        if undo.fields.contains(AccountFields::WARM) {
+                            entry.is_warm = previous_is_warm;
+                        }
                         // EIP-161 preserves the historical Yellow Paper K.1 precompile-3 touch.
-                        if !(features.contains(EvmFeatures::EIP161)
-                            && address == Address::with_last_byte(3))
+                        if undo.fields.contains(AccountFields::TOUCHED)
+                            && !(features.contains(EvmFeatures::EIP161)
+                                && address == Address::with_last_byte(3))
                         {
                             entry.is_touched = previous_is_touched;
                         }
-                        entry.is_destroyed = previous_is_destroyed;
-                        entry.just_created = previous_just_created;
-                        entry.code_changed = previous_code_changed;
+                        if undo.fields.contains(AccountFields::DESTROYED) {
+                            entry.is_destroyed = previous_is_destroyed;
+                        }
+                        if undo.fields.contains(AccountFields::CREATED) {
+                            entry.just_created = previous_just_created;
+                        }
+                        if undo.fields.intersects(AccountFields::CODE | AccountFields::CREATED) {
+                            entry.code_changed = previous_code_changed;
+                        }
                     }
                 }
                 JournalEntry::StorageChange { address, key, previous } => {
@@ -887,6 +925,12 @@ impl<'a> State<'a> {
                     {
                         slot.is_warm = false;
                     }
+                }
+                JournalEntry::StateReplaced { state, transient_storage, prewarm_set } => {
+                    self.accounts = state.accounts;
+                    self.transient_storage = transient_storage;
+                    self.prewarm_set = prewarm_set;
+                    self.selfdestructs = state.selfdestructs;
                 }
             }
         }
@@ -1017,8 +1061,7 @@ impl<'a> State<'a> {
     /// Account and slot originals become their current values, runtime slot warmth is cleared, and
     /// account warmth is retained only for pre-warmed addresses. Other account metadata is
     /// preserved.
-    #[cfg(test)]
-    pub(crate) fn prepare_isolated_state(&self) -> PendingState {
+    pub fn prepare_isolated_state(&self) -> PendingState {
         let mut accounts = self.accounts.clone();
         for (address, account) in &mut accounts {
             account.original = account.present.clone();
@@ -1037,8 +1080,7 @@ impl<'a> State<'a> {
     /// warmth is combined, current values are replaced, and account lifecycle flags are combined.
     /// Newly loaded accounts and slots retain their child metadata. Journals, logs, pre-warmed
     /// sets, transient storage and backing databases are unchanged.
-    #[cfg(test)]
-    pub(crate) fn merge_isolated_state(&mut self, child: PendingState) {
+    pub fn merge_isolated_state(&mut self, child: PendingState) {
         for (address, account) in child.accounts {
             match self.accounts.entry(address) {
                 hash_map::Entry::Vacant(entry) => {

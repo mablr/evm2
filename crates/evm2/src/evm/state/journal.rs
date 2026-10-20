@@ -1,7 +1,8 @@
 //! Revert journal and checkpoint types.
 
-use super::AccountInfo;
-use crate::interpreter::Word;
+use super::{AccountInfo, PendingState, PrewarmSet};
+use crate::{interpreter::Word, storage_key::StorageKeyMap};
+use alloc::boxed::Box;
 use alloy_primitives::Address;
 
 /// State checkpoint for reverting state changes.
@@ -39,8 +40,7 @@ impl StateCheckpoint {
 #[non_exhaustive]
 pub enum JournalEntry {
     /// Account overlay snapshot recorded before the first mutation made through an
-    /// [`AccountHandle`](super::AccountHandle), reverting the present account value and all
-    /// per-account flags in one entry.
+    /// [`AccountHandle`](super::AccountHandle), undoing only that handle's field and flag changes.
     AccountChange {
         /// Account address.
         address: Address,
@@ -56,6 +56,8 @@ pub enum JournalEntry {
         previous_just_created: bool,
         /// Previous code-changed flag.
         previous_code_changed: bool,
+        /// Fields changed by this handle and their inverse operations.
+        undo: AccountUndo,
     },
     /// Persistent storage changed.
     StorageChange {
@@ -82,6 +84,39 @@ pub enum JournalEntry {
         /// Storage key.
         key: Word,
     },
+    /// Transaction state displaced by a host snapshot restoration.
+    StateReplaced {
+        /// Displaced loaded accounts and selfdestructs.
+        state: Box<PendingState>,
+        /// Displaced transient storage.
+        transient_storage: StorageKeyMap<Word>,
+        /// Displaced transaction-initial warm set.
+        prewarm_set: PrewarmSet,
+    },
+}
+
+/// Inverse operations for an account handle, without overwriting unrelated host writes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AccountUndo {
+    pub(super) fields: AccountFields,
+    pub(super) balance_delta: Word,
+    pub(super) nonce_bumps: u64,
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct AccountFields: u16 {
+        const BALANCE = 1 << 0;
+        const NONCE = 1 << 1;
+        const CODE = 1 << 2;
+        const EXTENSION = 1 << 3;
+        const WARM = 1 << 4;
+        const TOUCHED = 1 << 5;
+        const DESTROYED = 1 << 6;
+        const CREATED = 1 << 7;
+        const INFO = Self::BALANCE.bits() | Self::NONCE.bits() | Self::CODE.bits()
+            | Self::EXTENSION.bits();
+    }
 }
 
 #[cfg(test)]
@@ -266,5 +301,28 @@ mod tests {
         assert!(!state.take_pending_state().is_changed());
 
         assert!(state.storage_slot(&account, key).unwrap().warm());
+    }
+
+    #[test]
+    fn reverting_replacement_undoes_ordinary_writes_to_displaced_state() {
+        let address = Address::with_last_byte(0x19);
+        let mut database = CacheDB::default();
+        database.insert_account_info(&address, AccountInfo::default().with_nonce(1));
+        let mut state = State::new(database.clone());
+        state.account(&address).unwrap();
+        let snapshot = state.snapshot();
+        let unloaded = Address::with_last_byte(0x20);
+        state
+            .overlay_db_mut()
+            .insert_account_info(&unloaded, AccountInfo::default().with_balance(Word::from(7)));
+        let checkpoint = state.checkpoint();
+        state.account(&address).unwrap().bump_nonce();
+        state.account(&address).unwrap().get_or_insert_untracked().nonce = 7;
+        state.replace_state(snapshot.into_state(database));
+        assert_eq!(state.account(&address).unwrap().nonce(), 1);
+
+        state.rollback(checkpoint, Version::base(SpecId::CANCUN).features);
+        assert_eq!(state.account(&address).unwrap().nonce(), 6);
+        assert_eq!(state.account(&unloaded).unwrap().balance(), Word::ZERO);
     }
 }

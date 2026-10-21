@@ -280,4 +280,28 @@ mod tests {
 
         assert!(state.storage_slot(&account, key).unwrap().warm());
     }
+
+    #[test]
+    fn touch_only_absent_account_preserves_host_storage_on_streamed_commit() {
+        let address = Address::repeat_byte(0x46);
+        let key = Word::from(3);
+        let value = Word::from(7);
+        let mut state = State::new(CacheDB::default());
+        state.account(&address).unwrap().touch();
+        state.storage_slot(&address, key).unwrap().override_value(value);
+        state.finalize_transaction(Version::base(SpecId::CANCUN)).unwrap();
+        let pending = state.take_pending_state();
+        let changes = pending.account_changes().next().unwrap();
+        assert!(changes.touched);
+        assert!(!changes.is_info_changed());
+        assert_eq!(changes.original, None);
+        assert_eq!(changes.current, None);
+
+        let mut streamed = State::new(CacheDB::default());
+        streamed.commit_source(&pending);
+        assert_eq!(streamed.storage_slot_untracked(&address, &key).unwrap(), value);
+        state.set_pending_state(pending);
+        state.commit_transaction();
+        assert_eq!(state.storage_slot_untracked(&address, &key).unwrap(), value);
+    }
 }

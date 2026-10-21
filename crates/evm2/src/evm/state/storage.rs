@@ -14,6 +14,8 @@ pub struct StorageOverlay {
     /// Whether consumers must delete all pre-existing storage for the account
     /// before applying individual slot changes.
     pub wiped: bool,
+    /// Whether late-loaded wiped slots must retain their transaction-boundary originals.
+    pub(crate) preserve_originals: bool,
     /// Loaded storage slots. A slot is present here only once it has been loaded or written, so
     /// its value is always meaningful; EIP-2929 warmth is tracked per slot in
     /// [`StorageSlot::is_warm`].
@@ -27,6 +29,7 @@ impl StorageOverlay {
     #[cfg(test)]
     pub(crate) fn merge_isolated(&mut self, child: Self) {
         self.wiped |= child.wiped;
+        self.preserve_originals |= child.preserve_originals;
         for (key, slot) in child.slots {
             match self.slots.entry(key) {
                 hash_map::Entry::Vacant(entry) => {
@@ -182,8 +185,9 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
     /// [`StorageSlotHandle`] always refers to a slot with a meaningful value. On first load the
     /// slot's [`StorageSlot::is_warm`] is seeded from the base warm set (EIP-2930 access list),
     /// mirroring how [`account_raw`](super::State) seeds an account's warmth. The load itself
-    /// records no revert entry: the cached value's original equals its current, so it is left in
-    /// place by [`State::rollback`](super::State::rollback) as a harmless cache. Used by
+    /// records no revert entry: the slot retains its current value across rollback. After an
+    /// [`Self::override_wipe`], its current value is zero but its original is still loaded for
+    /// SSTORE gas accounting. Used by
     /// [`State::storage_slot`](super::State::storage_slot) to reach a single slot directly.
     #[inline]
     pub fn into_slot_with_skip(
@@ -236,12 +240,16 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
                 if skip_cold_load && !is_warm {
                     return Err(LoadError::ColdLoadSkipped);
                 }
-                let value = if storage.wiped {
-                    Word::ZERO
-                } else {
+                let original = if !storage.wiped || storage.preserve_originals {
                     inner.database.get_storage(address, &key)?
+                } else {
+                    Word::ZERO
                 };
-                (entry.insert(StorageSlot::loaded(value, is_warm)), !is_warm)
+                let mut slot = StorageSlot::loaded(original, is_warm);
+                if storage.wiped {
+                    slot.value.set_current(Word::ZERO);
+                }
+                (entry.insert(slot), !is_warm)
             }
         };
         if WARM && is_cold {
@@ -262,6 +270,7 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
     #[inline]
     pub fn wipe(&mut self) {
         self.storage.wiped = true;
+        self.storage.preserve_originals = false;
         self.storage.slots.iter_mut().for_each(|(_, slot)| {
             slot.value.set_current(Word::ZERO);
         });
@@ -271,10 +280,12 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
     ///
     /// Unlike the finalization-only [`Self::wipe`], this also zeros earlier storage undo values,
     /// so rollback cannot resurrect pre-wipe slots. Transaction-boundary originals and warmth
-    /// are unchanged. Change export emits the wipe followed by nonzero current slots only.
+    /// are unchanged, including originals fetched lazily after the wipe for SSTORE accounting.
+    /// Change export emits the wipe followed by nonzero current slots only.
     /// Use [`StorageSlotHandle::override_value`] to reinsert slots that must also survive rollback.
     pub fn override_wipe(&mut self) {
         self.wipe();
+        self.storage.preserve_originals = true;
         for entry in &mut self.inner.journal {
             if let JournalEntry::StorageChange { address, previous, .. } = entry
                 && address == self.address

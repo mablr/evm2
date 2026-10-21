@@ -252,7 +252,6 @@ fn visit_block_changes<S: StateChangeSink>(
             // Block-level aggregation loses per-transaction lifecycle flags.
             created: false,
             selfdestructed: false,
-            touched: false,
         })?;
     }
     Ok(())
@@ -313,7 +312,7 @@ mod tests {
         pending.accounts.insert(address, Account::new(original, current));
         if wiped || !slots.is_empty() {
             pending.accounts.entry(address).or_default().storage =
-                StorageOverlay { wiped, slots, _non_exhaustive: () };
+                StorageOverlay { wiped, slots, ..Default::default() };
         }
         pending
     }

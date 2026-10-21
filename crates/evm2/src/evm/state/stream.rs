@@ -25,11 +25,6 @@ pub struct AccountChangeRef<'a> {
     /// Only transaction-level sources report this; block-level aggregation loses per-transaction
     /// lifecycle flags and reports `false`.
     pub selfdestructed: bool,
-    /// Whether the account was touched by the transaction, even if its info is unchanged.
-    ///
-    /// Reverted touches are excluded, except for the EIP-161 precompile-3 rule. Block-level
-    /// aggregation loses transaction touch metadata and reports `false`.
-    pub touched: bool,
 }
 
 /// One loaded account's transaction changes: its metadata, new bytecode, and storage overlay.
@@ -52,6 +47,7 @@ pub struct AccountChanges<'a> {
     ///
     /// Loaded-only accounts are not touched. Reverted touches are excluded, except for the
     /// EIP-161 precompile-3 rule. This metadata survives transaction finalization and detachment.
+    /// It is not emitted through [`StateChangeSink`].
     pub touched: bool,
     /// The account's new bytecode keyed by code hash, when its code changed to non-empty code.
     pub code: Option<(B256, &'a Bytecode)>,
@@ -97,14 +93,13 @@ impl<'a> AccountChanges<'a> {
                 sink.storage_read(address, key, value.current)?;
             }
         }
-        if self.is_info_changed() || self.touched {
+        if self.is_info_changed() {
             sink.account(AccountChangeRef {
                 address,
                 original: self.original,
                 current: self.current,
                 created: self.created,
                 selfdestructed: self.selfdestructed,
-                touched: self.touched,
             })
         } else {
             sink.account_read(address, self.current)
@@ -137,7 +132,7 @@ pub trait StateChangeSink {
         Ok(())
     }
 
-    /// Observes an account change or an unchanged account touched by the transaction.
+    /// Observes an account change.
     #[inline]
     fn account(&mut self, _change: AccountChangeRef<'_>) -> Result<(), Self::Error> {
         Ok(())

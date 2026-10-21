@@ -1874,7 +1874,8 @@ fn eip7708_transfer_log(from: &Address, to: &Address, value: &Word) -> Option<Lo
 mod tests {
     use super::*;
     use crate::{
-        BaseEvmConfigSelector, BaseEvmTypes, NoopInspector, Precompiles, SpecId, Version,
+        BaseEvmConfigSelector, BaseEvmTypes, NoopInspector, Precompiles, SpecId, StorageKey,
+        Version,
         bytecode::Bytecode,
         env::{BlockEnvExt, TxEnvExt},
         ethereum::{RecoveredTxEnvelope, TxEnvelope, ethereum_tx_registry},
@@ -4377,22 +4378,6 @@ mod tests {
                 touched
             );
         }
-        // A touch-only account is streamed as metadata, not silently downgraded to a read.
-        struct TouchSink(Vec<Address>);
-        impl StateChangeSink for TouchSink {
-            type Error = core::convert::Infallible;
-            fn account(&mut self, change: state::AccountChangeRef<'_>) -> Result<(), Self::Error> {
-                if change.touched {
-                    self.0.push(change.address);
-                }
-                Ok(())
-            }
-        }
-        let mut sink = TouchSink(Vec::new());
-        pending.visit(&mut sink).unwrap();
-        assert!(sink.0.contains(&target));
-        assert!(!sink.0.contains(&read));
-        assert!(!sink.0.contains(&leaf));
         evm.state.set_pending_state(pending);
         evm.state.commit_transaction();
         let tx = Recovered::new_unchecked(
@@ -4407,5 +4392,91 @@ mod tests {
         let next = evm.transact(&tx).unwrap();
         assert!(next.result().status);
         assert!(!next.account_changes().find(|c| c.address == target).unwrap().touched);
+    }
+
+    #[rstest::rstest]
+    #[case(SpecId::CANCUN, 7, 2_206, -2_000, 0)]
+    #[case(SpecId::CANCUN, 0, 22_106, 0, 0)]
+    #[case(SpecId::AMSTERDAM, 7, 2_106, -1_616, 0)]
+    #[case(SpecId::AMSTERDAM, 0, 12_106, 0, 97_920)]
+    fn override_wipe_sstore_is_independent_of_slot_load_order(
+        #[case] spec: SpecId,
+        #[case] original: u64,
+        #[case] execution_gas: u64,
+        #[case] refund: i64,
+        #[case] state_gas: i64,
+    ) {
+        let address = Address::repeat_byte(0x45);
+        let key = Word::from(3);
+        let original = Word::from(original);
+        for preload in [true, false] {
+            let mut database = InMemoryDB::default();
+            database.insert_account_info(&address, AccountInfo::default().with_nonce(1));
+            database.insert_account_storage(&address, &key, &original);
+            let mut evm = Evm::<BaseEvmTypes>::new(
+                spec,
+                BlockEnvExt::default(),
+                ethereum_tx_registry(spec),
+                database,
+                Precompiles::base(spec),
+            );
+            let outer = evm.state.checkpoint();
+            if preload {
+                evm.state.storage_slot(&address, key).unwrap();
+            }
+            evm.state.storage(&address).unwrap().override_wipe();
+            let slot = evm.state.storage_slot(&address, key).unwrap();
+            assert_eq!(slot.original(), original, "preload={preload}");
+            assert_eq!(slot.current(), Word::ZERO);
+            assert!(!slot.is_warm());
+
+            // PUSH1(7), PUSH1(3), SSTORE: a cold dirty-slot restoration, or new-slot control.
+            // Cancun restoration: 6 + 100 + 2100 gas; refund -4800 + 2800.
+            // Amsterdam restoration: 6 + 100 + 2000 gas; refund -11616 + 10000.
+            // Only an originally zero slot pays new-slot execution and state gas.
+            let reservoir = if spec == SpecId::AMSTERDAM { 200_000 } else { 0 };
+            let mut message = MessageExt {
+                destination: address,
+                gas_limit: 200_000,
+                reservoir,
+                code: legacy_bytecode([op::PUSH1, 7, op::PUSH1, 3, op::SSTORE, op::STOP]),
+                ..Default::default()
+            };
+            let result =
+                Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
+            assert_eq!(result.stop, InstrStop::Stop);
+            assert_eq!(result.gas.spent(), execution_gas);
+            assert_eq!(result.gas.refunded(), refund);
+            assert_eq!(result.gas.state_gas_spent(), state_gas);
+            assert_eq!(result.gas.reservoir(), reservoir - state_gas as u64);
+
+            let pending = evm.state.take_pending_state();
+            let mut exported = BlockStateAccumulator::new();
+            pending.visit(&mut exported).unwrap();
+            assert_eq!(exported.storage_wipes_sorted(), [address]);
+            let slots = exported.storage_sorted();
+            assert_eq!(slots.len(), 1);
+            assert_eq!(slots[0].0, StorageKey::new(address, key));
+            assert_eq!(*slots[0].1, Tracked::from_parts(original, Word::from(7)));
+
+            evm.state.set_pending_state(pending);
+            evm.state.rollback(outer.clone(), evm.features);
+            let slot = evm.state.storage_slot(&address, key).unwrap();
+            assert_eq!(slot.original(), original);
+            assert_eq!(slot.current(), Word::ZERO);
+            assert!(!slot.is_warm());
+            // A host reinsertion survives the same enclosing rollback and must be exported even
+            // when it equals the committed original.
+            evm.state.storage_slot(&address, key).unwrap().override_value(Word::from(7));
+            evm.state.rollback(outer, evm.features);
+            let pending = evm.state.take_pending_state();
+            let mut exported = BlockStateAccumulator::new();
+            pending.visit(&mut exported).unwrap();
+            assert_eq!(exported.storage_wipes_sorted(), [address]);
+            assert_eq!(
+                *exported.storage_sorted()[0].1,
+                Tracked::from_parts(original, Word::from(7))
+            );
+        }
     }
 }

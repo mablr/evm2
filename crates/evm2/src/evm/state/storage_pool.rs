@@ -30,6 +30,7 @@ impl StoragePool {
     pub(super) fn clear_overlay(&mut self, overlay: &mut StorageOverlay) {
         let mut slots = core::mem::take(&mut overlay.slots);
         overlay.wiped = false;
+        overlay.preserve_originals = false;
         let capacity = slots.capacity();
         if capacity == 0
             || capacity > MAX_MAP_CAPACITY

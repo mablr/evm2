@@ -216,9 +216,11 @@ impl StateChangeSink for CanonicalState {
     type Error = Infallible;
 
     fn account(&mut self, change: AccountChangeRef<'_>) -> Result<(), Self::Error> {
-        // Touch-only and created-then-destroyed accounts can reach this callback without a
-        // net account change. Match `state_from_revm`, which omits both from the state diff.
-        if change.current == change.original {
+        // A created-then-destroyed account (e.g. a CREATE whose init code selfdestructs) ends
+        // the transaction absent with no transaction-boundary original, a net no-op. revm's
+        // `state_from_revm` omits such an account, so drop the spurious `None` deletion here to
+        // keep the two backends' diffs symmetric.
+        if change.current.is_none() && change.original.is_none() {
             return Ok(());
         }
         let account = change.current.map(|info| CanonicalAccount {

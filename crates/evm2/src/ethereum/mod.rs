@@ -622,7 +622,7 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
             }
             MessageExt {
                 kind: MessageKind::Call,
-                depth: 0,
+                depth: host.version().initial_call_depth,
                 gas_limit: tx_gas.remaining(),
                 reservoir: tx_gas.reservoir(),
                 destination: to,
@@ -653,7 +653,7 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
             }
             MessageExt {
                 kind: MessageKind::Create,
-                depth: 0,
+                depth: host.version().initial_call_depth,
                 gas_limit: tx_gas.remaining(),
                 reservoir: tx_gas.reservoir(),
                 destination,
@@ -670,7 +670,7 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
             }
         }
     };
-    debug_assert_eq!(message.depth, 0);
+    debug_assert_eq!(message.depth, host.version().initial_call_depth);
     Ok(Some(InitialFrame { message, charged_state_gas }))
 }
 

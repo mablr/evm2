@@ -252,6 +252,7 @@ fn visit_block_changes<S: StateChangeSink>(
             // Block-level aggregation loses per-transaction lifecycle flags.
             created: false,
             selfdestructed: false,
+            touched: false,
         })?;
     }
     Ok(())

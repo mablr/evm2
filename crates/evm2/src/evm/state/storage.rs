@@ -266,6 +266,23 @@ impl<'a, 'db> StorageHandle<'a, 'db> {
             slot.value.set_current(Word::ZERO);
         });
     }
+
+    /// Wipes storage across every enclosing checkpoint, without touching the account.
+    ///
+    /// Unlike the finalization-only [`Self::wipe`], this also zeros earlier storage undo values,
+    /// so rollback cannot resurrect pre-wipe slots. Transaction-boundary originals and warmth
+    /// are unchanged. Change export emits the wipe followed by nonzero current slots only.
+    /// Use [`StorageSlotHandle::override_value`] to reinsert slots that must also survive rollback.
+    pub fn override_wipe(&mut self) {
+        self.wipe();
+        for entry in &mut self.inner.journal {
+            if let JournalEntry::StorageChange { address, previous, .. } = entry
+                && address == self.address
+            {
+                *previous = Word::ZERO;
+            }
+        }
+    }
 }
 
 /// A mutable, journaled handle to a single, loaded persistent storage slot.
@@ -382,6 +399,23 @@ impl StorageSlotHandle<'_, '_> {
         self.set(value);
         (original_value, present_value)
     }
+
+    /// Replaces the live slot value and every earlier undo value for this slot.
+    ///
+    /// Unlike [`Self::set_untracked`], earlier writes cannot restore pre-override values on
+    /// rollback. Later ordinary writes still revert to this value. The transaction-boundary
+    /// original and warmth are unchanged; the account is not touched.
+    pub fn override_value(&mut self, value: Word) {
+        self.slot.value.current = value;
+        for entry in &mut self.inner.journal {
+            if let JournalEntry::StorageChange { address, key, previous } = entry
+                && address == self.address
+                && *key == self.key
+            {
+                *previous = value;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -390,8 +424,8 @@ mod tests {
     use crate::{
         SpecId, Version,
         evm::{
-            CacheDB,
-            state::{AccountInfo, State},
+            BlockStateAccumulator, CacheDB,
+            state::{AccountInfo, State, StateChangeSource},
         },
     };
     use alloc::vec;
@@ -604,5 +638,70 @@ mod tests {
         let mut slot = state.storage_slot(&address, key).unwrap();
         assert!(slot.is_warm());
         assert!(!slot.warm(), "base-prewarmed slot must not report a cold transition");
+    }
+
+    #[test]
+    fn storage_override_wipe_and_reinserts_survive_nested_rollback() {
+        let address = Address::repeat_byte(0x36);
+        let other = Address::repeat_byte(0x37);
+        let features = Version::base(SpecId::CANCUN).features;
+        let mut database = CacheDB::default();
+        database.insert_account_info(&address, AccountInfo::default().with_nonce(1));
+        for key in 0..4 {
+            database.insert_account_storage(&address, &Word::from(key), &Word::from(key + 2));
+        }
+        let mut state = State::new(database);
+        state.storage_slot(&address, Word::ZERO).unwrap().warm();
+        let outer = state.checkpoint();
+        state.storage_slot(&address, Word::from(1)).unwrap().set(Word::from(5));
+        state.storage_slot(&other, Word::from(1)).unwrap().set(Word::from(77));
+        let inner = state.checkpoint();
+        state.storage_slot(&address, Word::from(1)).unwrap().set(Word::from(6));
+        state.storage_slot(&address, Word::from(2)).unwrap().set(Word::from(8));
+
+        state.storage(&address).unwrap().override_wipe();
+        // Reinsert a value equal to its transaction original, plus a previously unloaded slot.
+        state.storage_slot(&address, Word::from(1)).unwrap().override_value(Word::from(3));
+        state.storage_slot(&address, Word::from(4)).unwrap().override_value(Word::from(9));
+        state.storage_slot(&address, Word::from(4)).unwrap().set(Word::from(11));
+
+        for checkpoint in [inner, outer] {
+            state.rollback(checkpoint, features);
+            for (key, expected) in [(0, 0), (1, 3), (2, 0), (3, 0), (4, 9)] {
+                assert_eq!(
+                    state.storage_slot(&address, Word::from(key)).unwrap().current(),
+                    Word::from(expected)
+                );
+            }
+            assert!(state.storage(&address).unwrap().is_wiped());
+            assert!(state.storage_slot(&address, Word::ZERO).unwrap().is_warm());
+        }
+        assert_eq!(state.storage_slot(&other, Word::from(1)).unwrap().current(), Word::ZERO);
+        assert!(!state.account(&address).unwrap().is_touched());
+
+        let pending = state.take_pending_state();
+        let changes = pending.account_changes().find(|c| c.address == address).unwrap();
+        let mut slots = changes
+            .storage
+            .changed_slots()
+            .map(|(key, value)| (*key, *value))
+            .collect::<alloc::vec::Vec<_>>();
+        slots.sort_unstable_by_key(|(key, _)| *key);
+        assert_eq!(
+            slots,
+            vec![
+                (Word::from(1), Tracked::from_parts(Word::from(3), Word::from(3))),
+                (Word::from(4), Tracked::from_parts(Word::ZERO, Word::from(9))),
+            ]
+        );
+        let mut exported = BlockStateAccumulator::new();
+        pending.visit(&mut exported).unwrap();
+        assert_eq!(exported.storage_wipes_sorted(), [address]);
+        let slots = exported
+            .storage_sorted()
+            .into_iter()
+            .map(|(key, value)| (key.key(), value.current))
+            .collect::<alloc::vec::Vec<_>>();
+        assert_eq!(slots, [(Word::from(1), Word::from(3)), (Word::from(4), Word::from(9))]);
     }
 }

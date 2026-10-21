@@ -183,8 +183,14 @@ impl<T: EvmTypesHost> ExecutionConfig<T> {
     }
 
     /// Replaces the runtime version data while keeping the same dispatch table.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Version::initial_call_depth`] leaves no room for the full call budget and
+    /// the attempted-too-deep message.
     #[inline]
     pub const fn with_version(mut self, version: Version) -> Self {
+        let _ = version.max_call_depth();
         self.version = version;
         self
     }

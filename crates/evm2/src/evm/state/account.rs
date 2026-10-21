@@ -184,6 +184,8 @@ pub(crate) struct Account {
     pub(crate) is_warm: bool,
     /// Whether this account is touched for transaction-finalization account-lifetime rules.
     pub(crate) is_touched: bool,
+    /// Touch metadata retained after finalization consumes `is_touched`.
+    pub(crate) finalized_touched: bool,
     /// Whether this account has been self-destructed in the current transaction.
     pub(crate) is_destroyed: bool,
     /// Whether the present overlay account was created in the current transaction.
@@ -266,6 +268,7 @@ impl Account {
             current: self.present.as_ref(),
             created: self.is_created(),
             selfdestructed,
+            touched: self.is_touched || self.finalized_touched,
             code: self.changed_code(),
             storage: &self.storage,
         }
@@ -781,12 +784,40 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
             }
         }
     }
+
+    /// Replaces code and its hash in the live account and every existing revert snapshot.
+    ///
+    /// Unlike [`Self::set_code`], this survives rollback of any enclosing checkpoint, including
+    /// one predating account creation. Absent accounts and snapshots are materialized as empty
+    /// accounts with this code. Other fields and lifecycle flags retain their usual rollback
+    /// behavior. This does not touch the account or change its transaction-boundary original.
+    /// The caller is responsible for `code_hash` matching `code`.
+    pub fn override_code(&mut self, code_hash: B256, code: Bytecode) {
+        for entry in self.snapshot.iter_mut().chain(self.inner.journal.iter_mut()) {
+            if let JournalEntry::AccountChange { address, previous, previous_code_changed, .. } =
+                entry
+                && *address == self.address
+            {
+                let account = previous.get_or_insert_with(empty_account);
+                account.code_hash = code_hash;
+                account.code = Some(code.clone());
+                *previous_code_changed = true;
+            }
+        }
+        let account = self.tracked.present.get_or_insert_with(empty_account);
+        account.code_hash = code_hash;
+        account.code = Some(code);
+        self.tracked.code_changed = true;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evm::{CacheDB, state::State};
+    use crate::{
+        SpecId, Version,
+        evm::{CacheDB, state::State},
+    };
     use alloy_primitives::Address;
 
     #[test]
@@ -1150,5 +1181,50 @@ mod tests {
         }
         state.rollback(parent, features);
         assert_eq!(state.account(&address).unwrap().get(), Some(&original));
+    }
+
+    #[test]
+    fn code_override_survives_nested_rollback_without_preserving_other_fields() {
+        let address = Address::repeat_byte(0x93);
+        let other = Address::repeat_byte(0x94);
+        let features = Version::base(SpecId::CANCUN).features;
+        let code = Bytecode::new_eip7702(other);
+        let hash = code.hash_slow();
+        for original in [None, Some(AccountInfo::default().with_nonce(3))] {
+            let mut database = CacheDB::default();
+            if let Some(info) = &original {
+                database.insert_account_info(&address, info.clone());
+            }
+            let mut state = State::new(database);
+            let outer = state.checkpoint();
+            state.account(&other).unwrap().set_code_slow(code.clone());
+            state.account(&address).unwrap().set_nonce(5);
+            let inner = state.checkpoint();
+            {
+                let mut account = state.account(&address).unwrap();
+                account.set_code_slow(Bytecode::default());
+                account.mark_created();
+                account.override_code(hash, code.clone());
+                account.set_code_slow(Bytecode::default());
+            }
+
+            state.rollback(inner, features);
+            assert_eq!(state.account(&address).unwrap().load_code().unwrap(), code);
+            assert_eq!(state.account(&address).unwrap().nonce(), 5);
+            state.rollback(outer, features);
+            let mut account = state.account(&address).unwrap();
+            assert_eq!(account.code_hash(), hash);
+            assert_eq!(account.load_code().unwrap(), code);
+            assert_eq!(account.nonce(), original.as_ref().map_or(0, |info| info.nonce));
+            assert!(!account.is_touched());
+            assert!(!account.is_created());
+            drop(account);
+            assert!(!state.account(&other).unwrap().exists());
+
+            let pending = state.take_pending_state();
+            let changes = pending.account_changes().find(|c| c.address == address).unwrap();
+            assert_eq!(changes.original, original.as_ref());
+            assert_eq!(changes.code, Some((hash, &code)));
+        }
     }
 }

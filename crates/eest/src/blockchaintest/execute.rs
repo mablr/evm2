@@ -992,6 +992,7 @@ impl StateChangeSource for AccountStateChange {
             current: self.current.as_ref(),
             created: false,
             selfdestructed: false,
+            touched: false,
         })
     }
 }

@@ -619,8 +619,11 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     /// Marks the present overlay account as created in the current transaction, also flagging its
     /// code as changed. The creation/code-change status is reverted together with the rest of the
     /// overlay by the [`JournalEntry::AccountChange`] snapshot recorded for this handle.
+    ///
+    /// Created accounts follow the EIP-6780 rules for `SELFDESTRUCT` and are emitted as created by
+    /// [`PendingState`](super::PendingState).
     #[inline]
-    pub(crate) fn mark_created(&mut self) {
+    pub fn mark_created(&mut self) {
         self.record_change();
         self.tracked.mark_created();
     }
@@ -687,6 +690,97 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
             previous.get_or_insert_with(empty_account).nonce = nonce;
         }
     }
+
+    /// Sets the balance without recording a revert entry, so that rolling back an enclosing
+    /// checkpoint does not undo the write.
+    ///
+    /// The account's earlier revert entries keep their relative effect: the balance each one
+    /// restores is shifted by the difference this write makes. For example, after a transfer of
+    /// 10 into an account holding 50 and an untracked write of 100, rolling back the transfer
+    /// leaves 90. Writing a non-zero balance materializes an absent account. The account is not
+    /// touched.
+    pub fn set_balance_untracked(&mut self, balance: Word) {
+        let current = self.balance();
+        self.rebase_revert_entries(|previous, _| {
+            let base = previous.as_ref().map_or(U256::ZERO, |account| account.balance);
+            let shifted = base.wrapping_add(balance).wrapping_sub(current);
+            match previous {
+                Some(account) => account.balance = shifted,
+                None if !shifted.is_zero() => {
+                    *previous = Some(empty_account().with_balance(shifted));
+                }
+                None => {}
+            }
+            true
+        });
+        match &mut self.tracked.present {
+            Some(account) => account.balance = balance,
+            None if !balance.is_zero() => {
+                self.tracked.present = Some(empty_account().with_balance(balance));
+            }
+            None => {}
+        }
+    }
+
+    /// Sets the nonce without recording a revert entry, so that rolling back an enclosing
+    /// checkpoint does not undo the write.
+    ///
+    /// Like [`Self::set_balance_untracked`], the account's earlier revert entries keep their
+    /// relative effect, back to the entry that created the account in this transaction, which
+    /// still restores the account as it was before creation. Writing a non-zero nonce
+    /// materializes an absent account. The account is not touched.
+    pub fn set_nonce_untracked(&mut self, nonce: u64) {
+        let current = self.nonce();
+        let shift = |base: u64| {
+            if nonce >= current {
+                base.saturating_add(nonce - current)
+            } else {
+                base.saturating_sub(current - nonce)
+            }
+        };
+        self.rebase_revert_entries(|previous, creates| {
+            if creates {
+                return false;
+            }
+            match previous {
+                Some(account) => account.nonce = shift(account.nonce),
+                None if shift(0) != 0 => *previous = Some(empty_account().with_nonce(shift(0))),
+                None => {}
+            }
+            true
+        });
+        match &mut self.tracked.present {
+            Some(account) => account.nonce = nonce,
+            None if nonce != 0 => self.tracked.present = Some(empty_account().with_nonce(nonce)),
+            None => {}
+        }
+    }
+
+    /// Calls `f` with the account value each of this account's revert entries restores, newest
+    /// first, and whether that entry restores the account as it was before its creation in this
+    /// transaction. Stops when `f` returns `false`.
+    fn rebase_revert_entries(&mut self, mut f: impl FnMut(&mut Option<AccountInfo>, bool) -> bool) {
+        let address = self.address;
+        // Whether the account is created in the state the entry being visited reverts from.
+        let mut created_after = self.tracked.just_created;
+        // This handle's pending snapshot is newer than every journal entry.
+        for entry in self.snapshot.iter_mut().chain(self.inner.journal.iter_mut().rev()) {
+            if let JournalEntry::AccountChange {
+                address: changed,
+                previous,
+                previous_just_created,
+                ..
+            } = entry
+                && *changed == address
+            {
+                let creates = created_after && !*previous_just_created;
+                created_after = *previous_just_created;
+                if !f(previous, creates) {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -694,6 +788,107 @@ mod tests {
     use super::*;
     use crate::evm::{CacheDB, state::State};
     use alloy_primitives::Address;
+
+    #[test]
+    fn untracked_writes_keep_earlier_relative_undo() {
+        use crate::{SpecId, Version};
+
+        let features = Version::base(SpecId::CANCUN).features;
+        let funded = Address::from([0x71; 20]);
+        let absent = Address::from([0x72; 20]);
+        let mut database = CacheDB::default();
+        database.insert_account_info(
+            &funded,
+            AccountInfo::default().with_balance(Word::from(50)).with_nonce(3),
+        );
+        database.insert_account_storage(&funded, &Word::from(1), &Word::from(10));
+        let mut state = State::new(database);
+        let balance = |state: &mut State<'_>, address| {
+            state.account_info_untracked(address).unwrap().map(|info| (info.balance, info.nonce))
+        };
+
+        let outer = state.checkpoint();
+        {
+            let mut account = state.account(&funded).unwrap();
+            account.set_balance(Word::from(60));
+            assert!(account.bump_nonce());
+        }
+        state.account(&absent).unwrap().set_balance(Word::from(10));
+        state.storage_slot(&funded, Word::from(1)).unwrap().set(Word::from(20));
+        let inner = state.checkpoint();
+        {
+            let mut account = state.account(&funded).unwrap();
+            account.set_balance_untracked(Word::from(100));
+            account.set_nonce_untracked(10);
+        }
+        state.account(&absent).unwrap().set_balance_untracked(Word::from(100));
+        state.storage_slot(&funded, Word::from(1)).unwrap().set_untracked(Word::from(30));
+
+        // Nothing after the inner checkpoint is undone.
+        state.rollback(inner, features);
+        assert_eq!(balance(&mut state, &funded), Some((Word::from(100), 10)));
+        assert_eq!(balance(&mut state, &absent), Some((Word::from(100), 0)));
+        assert_eq!(state.storage_slot_untracked(&funded, &Word::from(1)).unwrap(), Word::from(30));
+
+        // The earlier `+10` balance, nonce bump and transfer into the absent account are undone
+        // relative to the untracked values; the storage write restores its recorded value.
+        state.rollback(outer, features);
+        assert_eq!(balance(&mut state, &funded), Some((Word::from(90), 9)));
+        assert_eq!(balance(&mut state, &absent), Some((Word::from(90), 0)));
+        assert_eq!(state.storage_slot_untracked(&funded, &Word::from(1)).unwrap(), Word::from(10));
+    }
+
+    #[test]
+    fn untracked_nonce_does_not_survive_creation_undo() {
+        use crate::{SpecId, Version};
+
+        let features = Version::base(SpecId::CANCUN).features;
+        let created = Address::from([0x73; 20]);
+        let mut state = State::new(CacheDB::default());
+
+        let checkpoint = state.checkpoint();
+        {
+            let mut account = state.account(&created).unwrap();
+            account.mark_created();
+            account.set_nonce(1);
+        }
+        state.account(&created).unwrap().set_nonce_untracked(5);
+        assert_eq!(state.account_info_untracked(&created).unwrap().unwrap().nonce, 5);
+
+        state.rollback(checkpoint, features);
+        assert!(state.account_info_untracked(&created).unwrap().is_none());
+    }
+
+    #[test]
+    fn loaded_accounts_include_reads_and_absent_accounts() {
+        let read = Address::from([0x74; 20]);
+        let absent = Address::from([0x75; 20]);
+        let accepted = Address::from([0x76; 20]);
+        let mut database = CacheDB::default();
+        database.insert_account_info(&read, AccountInfo::default().with_balance(Word::from(1)));
+        database.insert_account_storage(&read, &Word::from(1), &Word::from(10));
+        let mut state = State::new(database);
+        state.account(&accepted).unwrap().set_balance(Word::from(1));
+        state.commit_transaction();
+
+        state.storage_slot(&read, Word::from(1)).unwrap();
+        state.storage_slot(&read, Word::from(2)).unwrap();
+        state.account(&absent).unwrap();
+
+        let mut loaded = state
+            .loaded_accounts()
+            .map(|(address, slots)| {
+                let mut slots = slots.copied().collect::<alloc::vec::Vec<_>>();
+                slots.sort_unstable();
+                (*address, slots)
+            })
+            .collect::<alloc::vec::Vec<_>>();
+        loaded.sort_unstable();
+        assert_eq!(
+            loaded,
+            [(read, alloc::vec![Word::from(1), Word::from(2)]), (absent, alloc::vec![])]
+        );
+    }
 
     #[test]
     fn transfer_to_self_requires_balance() {

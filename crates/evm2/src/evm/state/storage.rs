@@ -363,6 +363,14 @@ impl StorageSlotHandle<'_, '_> {
         });
     }
 
+    /// Sets the slot value without recording a revert entry, so that rolling back an enclosing
+    /// checkpoint does not undo the write. Earlier revert entries of the slot still restore the
+    /// values they recorded.
+    #[inline]
+    pub const fn set_untracked(&mut self, value: Word) {
+        self.slot.value.current = value;
+    }
+
     /// Writes `value`, returning the slot's transaction-boundary original value and the value the
     /// slot held just before this write — the pair `SSTORE` net-gas metering needs.
     ///

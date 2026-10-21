@@ -1321,6 +1321,100 @@ mod tests {
     }
 
     #[test]
+    fn frame_checkpoint_precedes_value_transfer_and_creation() {
+        // Records, at a call from the running frame, the running frame's checkpoint and the
+        // caller's balance and target's existence once a copy of the state rolls back to it.
+        #[derive(Default)]
+        struct CheckpointInspector {
+            observed: Option<(bool, Option<U256>, bool)>,
+        }
+        impl Inspector<BaseEvmTypes> for CheckpointInspector {
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                if message.destination != Address::with_last_byte(0x44) {
+                    return None;
+                }
+                let target = interp.message().destination;
+                let caller = interp.message().caller;
+                let evm = interp.host();
+                let checkpoint = evm.frame_checkpoint().cloned().unwrap();
+                let before_hook = checkpoint != evm.state().checkpoint();
+                let features = evm.version().features;
+                let mut state = evm.state().clone();
+                state.rollback(checkpoint, features);
+                let caller_balance =
+                    state.account_info_untracked(&caller).unwrap().map(|a| a.balance);
+                let target_exists = state.account_info_untracked(&target).unwrap().is_some();
+                self.observed = Some((before_hook, caller_balance, target_exists));
+                Some(MessageResultExt {
+                    stop: InstrStop::Return,
+                    gas: GasTracker::new(message.gas_limit),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let caller = Address::from([0xaa; 20]);
+        let target = Address::from([0xbb; 20]);
+        // CALL(gas, 0x44, 0, 0, 0, 0, 0), then STOP.
+        let code = vec![
+            op::PUSH0,
+            op::PUSH0,
+            op::PUSH0,
+            op::PUSH0,
+            op::PUSH0,
+            op::PUSH1,
+            0x44,
+            op::PUSH2,
+            0xff,
+            0xff,
+            op::CALL,
+            op::STOP,
+        ];
+        for to in [TxKind::Call(target), TxKind::Create] {
+            let mut database = InMemoryDB::default();
+            database.insert_account_info(
+                &caller,
+                AccountInfo::default().with_balance(U256::from(1_000_000_000_u64)),
+            );
+            database.insert_account_info(
+                &target,
+                AccountInfo::default().with_code(legacy_bytecode(code.clone())),
+            );
+            let mut evm = Evm::<BaseEvmTypes>::new(
+                SpecId::OSAKA,
+                BlockEnvExt::default(),
+                ethereum_tx_registry(SpecId::OSAKA),
+                database,
+                Precompiles::base(SpecId::OSAKA),
+            );
+            evm.set_inspector(CheckpointInspector::default());
+            let tx = Recovered::new_unchecked(
+                TxEnvelope::Legacy(TxLegacy {
+                    to,
+                    value: U256::from(5),
+                    input: if to.is_create() { code.clone().into() } else { Bytes::new() },
+                    gas_limit: 100_000,
+                    ..Default::default()
+                }),
+                caller,
+            );
+
+            let result = evm.transact(&tx).expect("transaction should execute").discard();
+            assert!(result.status);
+            let inspector = evm.inspector().unwrap().downcast_ref::<CheckpointInspector>().unwrap();
+            let (before_hook, caller_balance, target_exists) = inspector.observed.unwrap();
+            // The value transfer, and for a create the account creation, follow the checkpoint.
+            assert!(before_hook);
+            assert_eq!(caller_balance, Some(U256::from(1_000_000_000_u64)));
+            assert_eq!(target_exists, to.is_call());
+        }
+    }
+
+    #[test]
     fn cooling_loaded_slot_respects_access_list() {
         struct CoolSlotInspector {
             prewarmed: bool,

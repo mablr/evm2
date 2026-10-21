@@ -127,6 +127,32 @@ impl State<'_> {
     pub fn clone_with<'a>(&self, db: impl DynDatabase + 'a) -> State<'a> {
         self.snapshot().into_state(db)
     }
+
+    /// Like [`Self::snapshot`], but moves the in-memory state instead of cloning it, dropping the
+    /// backing database.
+    pub fn into_snapshot(self) -> StateSnapshot {
+        let Self { accounts, transient_storage, inner, .. } = self;
+        let StateInner { database, journal, logs, selfdestructs, prewarm_set } = inner;
+        StateSnapshot {
+            accounts,
+            transient_storage,
+            cache: database.cache,
+            bal_context: database.bal_context,
+            prewarm_set,
+            journal,
+            logs,
+            selfdestructs,
+        }
+    }
+
+    /// Returns the accounts loaded in the current transaction, each with the keys of its loaded
+    /// storage slots.
+    ///
+    /// This includes accounts loaded as absent and slots that were only read. Entries from the
+    /// accepted-state overlay that the transaction did not load are not included.
+    pub fn loaded_accounts(&self) -> impl Iterator<Item = (&Address, impl Iterator<Item = &Word>)> {
+        self.accounts.iter().map(|(address, account)| (address, account.storage.slots.keys()))
+    }
 }
 
 impl<'a> Deref for State<'a> {

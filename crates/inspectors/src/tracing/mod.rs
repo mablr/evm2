@@ -592,10 +592,11 @@ impl TracingInspector {
             return;
         };
 
-        // See comments in `start_step`.
+        // See comments in `start_step`. A call-like step's gas cost may already be filled by
+        // `fill_call_step_gas_cost`.
         debug_assert!(
             step.push_stack.is_none()
-                && step.gas_cost == 0
+                && (step.gas_cost == 0 || step.is_call_like_op())
                 && step.storage_change.is_none()
                 && step.status.is_none()
                 && step.decoded.is_none(),
@@ -654,9 +655,12 @@ impl TracingInspector {
         // The gas cost is the difference between the recorded gas remaining at the start of the
         // step the remaining gas here, at the end of the step.
         // TODO: Figure out why this can overflow. https://github.com/paradigmxyz/revm-inspectors/pull/38
-        step.gas_cost = interp
-            .failed_charge()
-            .unwrap_or_else(|| step.gas_remaining.saturating_sub(interp.gas().remaining()));
+        // A call-like step that started a child keeps the cost recorded before the child ran.
+        if step.gas_cost == 0 {
+            step.gas_cost = interp
+                .failed_charge()
+                .unwrap_or_else(|| step.gas_remaining.saturating_sub(interp.gas().remaining()));
+        }
         let state_gas_delta = interp.gas().state_gas_spent().saturating_sub(step.state_gas_spent);
         if step.state_gas_reservoir.is_some() && state_gas_delta != 0 {
             step.state_gas_cost = Some(state_gas_delta);
@@ -693,6 +697,25 @@ impl TracingInspector {
                     &mut self.budget,
                 );
             }
+        }
+    }
+
+    /// Fills the gas cost of the call-like step that is starting a child message.
+    ///
+    /// Invoked on [Inspector::call] and [Inspector::create], before the child trace starts. At this
+    /// point the parent frame has charged the step, including the gas forwarded to the child, but
+    /// the child has not returned any gas yet. This matches the step cost reported by geth and
+    /// revm, which end the step before the child runs.
+    fn fill_call_step_gas_cost(&mut self, gas_remaining: u64) {
+        // Only a step of the active frame can start the child, not one of an outer transaction
+        // that started a nested one from a hook.
+        if let Some(&(trace_idx, step_idx)) = self.step_stack.last()
+            && self.trace_stack.last().is_some_and(|entry| entry.trace_idx == trace_idx)
+            && let Some(step) = self.traces.arena[trace_idx].trace.steps.get_mut(step_idx)
+            && step.is_call_like_op()
+            && step.gas_cost == 0
+        {
+            step.gas_cost = step.gas_remaining.saturating_sub(gas_remaining);
         }
     }
 
@@ -801,6 +824,10 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
             .exclude_precompile_calls
             .then(|| self.is_precompile_call(interp.host(), &to, &value));
 
+        if self.config.record_steps {
+            self.fill_call_step_gas_cost(interp.gas().remaining());
+        }
+
         let input = if self.config.record_inputs
             && (self.trace_stack.is_empty() || self.budget.reserve(message.input.len()))
         {
@@ -842,6 +869,10 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
             self.spec_id = Some(interp.spec());
         }
         self.features = interp.version().features;
+
+        if self.config.record_steps {
+            self.fill_call_step_gas_cost(interp.gas().remaining());
+        }
 
         let input = if self.config.record_inputs
             && (self.trace_stack.is_empty() || self.budget.reserve(message.input.len()))

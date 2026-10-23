@@ -792,7 +792,9 @@ fn vmtrace_terminal_call_finalizes_delta_at_capture_limit() {
         let mem = ex.mem.as_ref().unwrap();
         assert_eq!(mem.off, 32);
         assert_eq!(mem.data.as_ref(), &[42]);
-        assert_eq!(ex.used, trace.ops[6].ex.as_ref().unwrap().used - call.cost);
+        // The call costs the forwarded 0xffff gas, of which the child returns all but the 16 it
+        // used.
+        assert_eq!(ex.used, trace.ops[6].ex.as_ref().unwrap().used - call.cost + 0xffff - 16);
     }
 }
 

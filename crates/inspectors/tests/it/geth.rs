@@ -1878,6 +1878,58 @@ fn test_geth_struct_log_out_of_gas_cost() {
     assert_eq!(sstore.gas_cost, 22_100);
 }
 
+/// Like geth and revm, a call-like step costs the gas it forwards to its child, and a code-less
+/// callee records no steps.
+#[test]
+fn test_call_like_step_gas_cost_includes_forwarded_gas() {
+    let contract = address!("0xc000000000000000000000000000000000000005");
+    let caller = address!("0xa000000000000000000000000000000000000005");
+    let empty = address!("0xe000000000000000000000000000000000000005");
+    // CALL the code-less account with 0x1000 gas, then CREATE with the one-byte init code `STOP`.
+    let mut code = hex!("60006000600060006000").to_vec();
+    code.push(op::PUSH20);
+    code.extend_from_slice(empty.as_slice());
+    code.extend_from_slice(&hex!("611000f150600160006000f05000"));
+
+    let context = Context::mainnet()
+        .with_db(CacheDB::<EmptyDB>::default())
+        .modify_cfg_chained(|cfg| cfg.spec = SpecId::LONDON)
+        .modify_db_chained(|db| {
+            db.insert_account_info(
+                &contract,
+                AccountInfo { code: Some(Bytecode::new_raw(code.into())), ..Default::default() },
+            );
+        });
+
+    let mut insp = TracingInspector::new(TracingInspectorConfig::default_geth());
+    let mut evm = context.build_mainnet().with_inspector(&mut insp);
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller,
+            gas_limit: 1_000_000,
+            gas_price: 0,
+            kind: TransactTo::Call(contract),
+            data: Bytes::default(),
+            nonce: 0,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(res.result.is_success(), "{res:#?}");
+
+    let nodes = insp.traces().nodes();
+    let [root, empty_call, create] = nodes else { panic!("unexpected traces: {nodes:#?}") };
+    assert_eq!(empty_call.trace.address, empty);
+    assert!(empty_call.trace.steps.is_empty(), "{:#?}", empty_call.trace.steps);
+    assert_eq!(create.trace.steps.len(), 1);
+
+    let call = root.trace.steps.iter().find(|step| step.op.get() == op::CALL).unwrap();
+    // Cold account access plus the forwarded gas.
+    assert_eq!(call.gas_cost, 2_600 + 0x1000);
+    let create_step = root.trace.steps.iter().find(|step| step.op.get() == op::CREATE).unwrap();
+    // CREATE plus one word of memory expansion plus the forwarded gas.
+    assert_eq!(create_step.gas_cost, 32_000 + 3 + create.trace.gas_limit);
+}
+
 /// EIP-7708: a transfer log of a reverted call is rolled back and does not consume an index.
 #[test]
 fn test_geth_calltracer_log_index_eip7708_revert() {

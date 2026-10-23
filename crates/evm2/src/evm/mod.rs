@@ -1397,6 +1397,17 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         if self.contains_precompile(message) {
             return self.execute_call_precompile(checkpoint, message);
         }
+        // Empty accounts complete the call without executing the bytecode's padding STOP.
+        if message.code.is_empty() {
+            return Ok(MessageResultExt {
+                stop: InstrStop::Stop,
+                gas: GasTracker::new_with_execution_gas_and_reservoir(
+                    message.gas_limit,
+                    message.reservoir,
+                ),
+                ..MessageResultExt::default()
+            });
+        }
         let stop = self.run_frame(tx_env, message, checkpoint.clone())?;
         Ok(self.finish_call_message_run(checkpoint, stop))
     }

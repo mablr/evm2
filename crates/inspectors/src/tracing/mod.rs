@@ -654,7 +654,6 @@ impl TracingInspector {
 
         // The gas cost is the difference between the recorded gas remaining at the start of the
         // step the remaining gas here, at the end of the step.
-        // TODO: Figure out why this can overflow. https://github.com/paradigmxyz/revm-inspectors/pull/38
         // A call-like step that started a child keeps the cost recorded before the child ran.
         if step.gas_cost == 0 {
             step.gas_cost = interp

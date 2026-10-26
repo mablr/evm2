@@ -826,7 +826,6 @@ impl<'a> State<'a> {
                         }
                         entry.is_destroyed = previous_is_destroyed;
                         entry.just_created = previous_just_created;
-                        entry.keeps_storage &= previous_just_created;
                         entry.code_changed = previous_code_changed;
                     }
                 }
@@ -1226,6 +1225,25 @@ mod tests {
         for key in [written, earlier] {
             assert_eq!(state.storage_slot(&address, key).unwrap().current(), Word::ZERO);
         }
+    }
+
+    #[test]
+    fn rollback_of_later_creation_mark_keeps_storage_baseline() {
+        let address = Address::with_last_byte(2);
+        let key = Word::from(1);
+        let features = Version::base(crate::SpecId::CANCUN).features;
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default().with_balance(Word::from(1)));
+        db.insert_account_storage(&address, &key, &Word::from(6));
+        let mut state = State::new(db);
+
+        state.account(&address).unwrap().mark_created_keeping_storage();
+        let checkpoint = state.checkpoint();
+        state.account(&address).unwrap().mark_created();
+        state.rollback(checkpoint, features);
+
+        assert!(!state.accounts[&address].discards_storage());
+        assert_eq!(state.storage_slot(&address, key).unwrap().current(), Word::from(6));
     }
 
     #[test]

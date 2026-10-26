@@ -224,10 +224,14 @@ impl Account {
     }
 
     /// Marks the account as created during the transaction, which also flags its code as changed.
+    ///
+    /// The first creation mark decides whether the account keeps its storage baseline.
     #[inline]
     pub(crate) const fn mark_created(&mut self) {
+        if !self.just_created {
+            self.keeps_storage = false;
+        }
         self.just_created = true;
-        self.keeps_storage = false;
         self.code_changed = true;
     }
 
@@ -666,9 +670,11 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     /// overlay keeps reading its old storage as zero.
     #[inline]
     pub fn mark_created_keeping_storage(&mut self) {
-        let keeps_storage = !self.tracked.just_created;
+        let first = !self.tracked.just_created;
         self.mark_created();
-        self.tracked.keeps_storage = keeps_storage;
+        if first {
+            self.tracked.keeps_storage = true;
+        }
     }
 
     /// Records a revert snapshot and returns the live account, materializing an empty one when it

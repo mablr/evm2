@@ -893,18 +893,20 @@ impl<'a> State<'a> {
             // EIP-8246: a self-destructed account that still holds balance is preserved as a
             // balance-only account instead of being burned. One with no balance is removed. The
             // handle is scoped so its `AccountChange` flushes on drop before the storage wipe.
-            let keeps_storage = {
+            let survives = {
                 let mut account = self.account(address)?;
-                if eip8246 && !account.balance().is_zero() {
+                let survives = eip8246 && !account.balance().is_zero();
+                if survives {
                     account.reset_selfdestructed_for_finalization();
-                    // Like revm, a created survivor keeps its unloaded old storage, which later
-                    // transactions read as zero.
-                    account.is_created()
                 } else {
                     account.delete_for_finalization();
-                    false
                 }
+                survives
             };
+            // Like revm, a created survivor keeps its unloaded old storage, which later
+            // transactions read as zero. One that keeps its storage baseline has no such reads,
+            // so its storage is wiped.
+            let keeps_storage = survives && self.accounts[address].discards_storage();
             let mut storage = self.storage(address)?;
             if keeps_storage { storage.zero_loaded() } else { storage.wipe() }
         }
@@ -1199,6 +1201,29 @@ mod tests {
         assert_eq!(storage.changed_slots().count(), 0);
         state.commit_transaction();
         for key in [written, old] {
+            assert_eq!(state.storage_slot(&address, key).unwrap().current(), Word::ZERO);
+        }
+    }
+
+    #[test]
+    fn eip8246_survivor_keeping_storage_wipes_it() {
+        let address = Address::with_last_byte(2);
+        let (written, earlier) = (Word::from(1), Word::from(2));
+        let version = Version::base(crate::SpecId::AMSTERDAM);
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, AccountInfo::default().with_balance(Word::from(1)));
+        // A slot the account's creation wrote before the transaction was suspended.
+        db.insert_account_storage(&address, &earlier, &Word::from(6));
+        let mut state = State::new(db);
+
+        state.account(&address).unwrap().mark_created_keeping_storage();
+        state.storage_slot(&address, written).unwrap().write(Word::from(9));
+        state.account(&address).unwrap().mark_destructed();
+        state.finalize_transaction_(version);
+
+        assert!(state.accounts[&address].storage.wiped);
+        state.commit_transaction();
+        for key in [written, earlier] {
             assert_eq!(state.storage_slot(&address, key).unwrap().current(), Word::ZERO);
         }
     }

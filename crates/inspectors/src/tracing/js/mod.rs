@@ -64,6 +64,8 @@ struct PendingStep {
     snapshot: StepSnapshot,
     gas_spent_before: u64,
     active: bool,
+    /// Set when the `step` callback of a call-like step, invoked before the child, failed.
+    failed: bool,
 }
 
 /// A javascript inspector that will delegate inspector functions to javascript functions
@@ -568,8 +570,8 @@ impl JsInspector {
     ///
     /// Invoked on [Inspector::call] and [Inspector::create]. The parent frame has charged the step
     /// at this point, including the gas forwarded to the child, but the child has not returned any
-    /// gas yet. `step_end` then skips the step. Like revm-inspectors, an error thrown by the step
-    /// callback does not affect the child.
+    /// gas yet. `step_end` then skips the step. An error thrown by the step callback does not
+    /// affect the child, `step_end` reverts the parent like for any other step.
     fn emit_call_step<T: EvmTypes>(
         &mut self,
         interp: &mut Interpreter<'_, '_, T>,
@@ -591,8 +593,9 @@ impl JsInspector {
                             | op::CREATE2
                     )
             })
+            && let Some((_, Err(_))) = self.emit_pending_step(interp)
         {
-            let _ = self.emit_pending_step(interp);
+            self.pending_steps[depth].failed = true;
         }
     }
 }
@@ -609,6 +612,7 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
         let pending = &mut self.pending_steps[depth];
         pending.gas_spent_before = interp.gas().spent();
         pending.active = true;
+        pending.failed = false;
         pending.snapshot.record(PreStep {
             pc: interp.pc() as u64,
             op: interp.opcode(),
@@ -623,13 +627,19 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
         if self.check_and_halt(interp) {
             return;
         }
-        let Some((is_revert, res)) = self.emit_pending_step(interp) else {
-            return;
+        let depth = usize::from(interp.message().depth);
+        let failed = match self.emit_pending_step(interp) {
+            Some((is_revert, res)) => !is_revert && res.is_err(),
+            // The step of a call-like opcode may have failed before its child ran.
+            None => self
+                .pending_steps
+                .get_mut(depth)
+                .is_some_and(|pending| core::mem::take(&mut pending.failed)),
         };
         if self.check_and_halt(interp) {
             return;
         }
-        if !is_revert && res.is_err() && interp.result().is_ok() {
+        if failed && interp.result().is_ok() {
             interp.set_stop(InstrStop::Revert);
         }
     }

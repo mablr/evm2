@@ -1898,7 +1898,7 @@ mod tests {
     use alloc::{borrow::Cow, string::ToString, sync::Arc, vec, vec::Vec};
     use alloy_consensus::{TxLegacy, transaction::Recovered};
     use alloy_eip7928::{BlockAccessList, StorageChange};
-    use alloy_primitives::{Address, Bytes, KECCAK256_EMPTY, Log, LogData, TxKind, U256};
+    use alloy_primitives::{Address, Bytes, Log, LogData, TxKind, U256};
     use core::{
         error::Error,
         fmt,
@@ -3597,7 +3597,7 @@ mod tests {
         let pending = evm.state.take_pending_state();
         let account =
             pending.accounts.get(&created).and_then(|entry| entry.present.as_ref()).unwrap();
-        assert_eq!(account.code_hash, KECCAK256_EMPTY);
+        assert!(account.is_empty_code_hash());
     }
 
     #[test]
@@ -3890,7 +3890,7 @@ mod tests {
             .expect("balance-only account should remain");
         assert_eq!(info.balance, U256::from(5));
         assert_eq!(info.nonce, 0);
-        assert_eq!(info.code_hash, KECCAK256_EMPTY);
+        assert!(info.is_empty_code_hash());
 
         let pending = state.take_pending_state();
         assert!(pending.accounts.contains_key(&contract), "account change recorded");
@@ -4123,7 +4123,7 @@ mod tests {
     fn validate_tx_discards_preparation_writes_on_success_and_error() {
         let mut evm = lifecycle_evm();
         let errors = [
-            HandlerError::InsufficientFunds,
+            HandlerError::NonceOverflow,
             HandlerError::Database(crate::DatabaseError::new(fmt::Error, true)),
             HandlerError::Database(crate::DatabaseError::new(fmt::Error, false)),
             HandlerError::Fatal("preparation failed".into()),
@@ -4214,7 +4214,7 @@ mod tests {
                 |_| Ok(()),
                 |req: TxRequest<'_, '_, BaseEvmTypes, TxLegacy>, ()| match req.tx.nonce {
                     0 => Ok(TxResultExt::default()),
-                    1 => Err(HandlerError::InsufficientFunds),
+                    1 => Err(HandlerError::NonceOverflow),
                     _ => panic!("transaction handler panicked"),
                 },
             ),
@@ -4227,7 +4227,7 @@ mod tests {
             }));
             match nonce {
                 0 => assert!(result.unwrap().is_ok()),
-                1 => assert_eq!(result.unwrap().unwrap_err(), HandlerError::InsufficientFunds),
+                1 => assert_eq!(result.unwrap().unwrap_err(), HandlerError::NonceOverflow),
                 _ => assert!(result.is_err()),
             }
             assert!(evm.clear_inspector_as::<NoopInspector>().is_some());

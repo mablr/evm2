@@ -128,23 +128,6 @@ impl State<'_> {
         self.snapshot().into_state(db)
     }
 
-    /// Like [`Self::snapshot`], but moves the in-memory state instead of cloning it, dropping the
-    /// backing database.
-    pub fn into_snapshot(self) -> StateSnapshot {
-        let Self { accounts, transient_storage, inner, .. } = self;
-        let StateInner { database, journal, logs, selfdestructs, prewarm_set } = inner;
-        StateSnapshot {
-            accounts,
-            transient_storage,
-            cache: database.cache,
-            bal_context: database.bal_context,
-            prewarm_set,
-            journal,
-            logs,
-            selfdestructs,
-        }
-    }
-
     /// Returns the accounts loaded in the current transaction, each with the keys of its loaded
     /// storage slots.
     ///
@@ -419,48 +402,6 @@ impl<'a> State<'a> {
         }
     }
 
-    /// Restores runtime access warmth added since a checkpoint without reverting writes.
-    ///
-    /// Journal entries remain in place so live frame checkpoints keep their cursors. Storage
-    /// values and originals, account lifetime flags, and transaction-base warmth are retained.
-    pub fn restore_access_warmth(&mut self, checkpoint: &StateCheckpoint) {
-        let mut accounts = AddressSet::default();
-        for entry in self.inner.journal.iter().skip(checkpoint.journal_len()) {
-            match entry {
-                JournalEntry::AccountChange { address, previous_is_warm, .. } => {
-                    if accounts.insert(*address)
-                        && let Some(account) = self.accounts.get_mut(address)
-                    {
-                        account.is_warm = *previous_is_warm;
-                    }
-                }
-                JournalEntry::StorageWarmed { address, key } => {
-                    if let Some(slot) = self
-                        .accounts
-                        .get_mut(address)
-                        .and_then(|account| account.storage.slots.get_mut(key))
-                    {
-                        slot.is_warm = false;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Cools loaded runtime accesses without changing values, originals, or journal entries.
-    ///
-    /// Transaction-base pre-warmed addresses and slots retain their effective warmth. This does
-    /// not rebase originals or finalize the state for a new transaction.
-    pub fn cool_loaded_state(&mut self) {
-        for (address, account) in &mut self.accounts {
-            account.is_warm = self.inner.prewarm_set.is_warm(address);
-            for slot in account.storage.slots.values_mut() {
-                slot.is_warm = false;
-            }
-        }
-    }
-
     /// Sets the warmth of an already-loaded account without journaling the change.
     ///
     /// Does nothing for unloaded accounts and leaves account values, storage, and the pre-warmed
@@ -506,8 +447,7 @@ impl<'a> State<'a> {
 
     /// Replaces transaction-base warmth when resuming suspended state in a running transaction.
     ///
-    /// Runtime warmth and journal entries are unchanged. Use [`Self::cool_loaded_state`] afterward
-    /// if loaded accesses should retain only the replacement set's warmth.
+    /// Runtime warmth and journal entries are unchanged.
     pub fn set_prewarm_set(&mut self, prewarm_set: PrewarmSet) {
         self.inner.prewarm_set = prewarm_set;
     }
@@ -945,11 +885,7 @@ impl<'a> State<'a> {
     /// transaction substate such as touches and selfdestructs, while finalization
     /// turns that substate into account deletions, storage wipes, balance-only
     /// selfdestruct resets (EIP-8246), or pre-EIP-161 empty-account materialization.
-    ///
-    /// Call only after the transaction's last revertible scope. This does not commit or clear
-    /// transaction scratch; callers accepting suspended state must do both afterward. On error,
-    /// dispose of the session rather than reuse partially finalized state.
-    pub fn finalize_transaction(&mut self, version: &Version) -> DbResult<()> {
+    pub(crate) fn finalize_transaction(&mut self, version: &Version) -> DbResult<()> {
         let selfdestructs = mem::take(&mut self.selfdestructs);
 
         let eip8246 = version.feature(EvmFeatures::EIP8246);
@@ -1587,101 +1523,6 @@ mod tests {
 
         assert_eq!(parent.account(&address).unwrap().nonce(), 1);
         assert_eq!(parent.storage_slot_untracked(&address, &key).unwrap(), Word::from(9));
-    }
-
-    #[test]
-    fn restore_access_warmth_preserves_writes_and_live_checkpoints() {
-        let kept = Address::with_last_byte(41);
-        let changed = Address::with_last_byte(42);
-        let base = Address::with_last_byte(43);
-        let key = Word::ONE;
-        let mut db = CacheDB::default();
-        db.insert_account_info(&changed, AccountInfo::default().with_nonce(1));
-        db.insert_account_storage(&changed, &key, &Word::from(5));
-        let mut state = State::new(db);
-        state.account(&kept).unwrap().warm();
-        state.storage_slot(&kept, key).unwrap().warm();
-        state.prewarm_storage_slot(&base, key);
-        let checkpoint = state.checkpoint();
-
-        state.account(&changed).unwrap().warm();
-        state.account(&changed).unwrap().set_balance(Word::from(7));
-        state.storage_slot(&changed, key).unwrap().warm();
-        state.storage_slot(&changed, key).unwrap().set(Word::from(11));
-        let nested = state.checkpoint();
-        state.account(&changed).unwrap().set_balance(Word::from(9));
-        state.storage_slot(&changed, key).unwrap().set(Word::from(13));
-        state.tstore(&changed, &key, &Word::from(17));
-        state.logs_mut().push(Log::default());
-        let journal = state.journal().to_vec();
-
-        state.restore_access_warmth(&checkpoint);
-
-        assert_eq!(state.journal(), journal);
-        assert!(state.account(&kept).unwrap().is_warm());
-        assert!(state.storage_slot(&kept, key).unwrap().is_warm());
-        assert!(state.account(&base).unwrap().is_warm());
-        assert!(state.storage_slot(&base, key).unwrap().is_warm());
-        assert!(!state.account(&changed).unwrap().is_warm());
-        assert!(state.account(&changed).unwrap().is_touched());
-        assert_eq!(state.account(&changed).unwrap().balance(), Word::from(9));
-        let slot = state.storage_slot(&changed, key).unwrap();
-        assert!(!slot.is_warm());
-        assert_eq!((slot.original(), slot.current()), (Word::from(5), Word::from(13)));
-        assert_eq!(state.tload(&changed, &key), Word::from(17));
-        assert_eq!(state.logs(), &[Log::default()]);
-
-        state.rollback(nested, EvmFeatures::empty());
-        assert_eq!(state.account(&changed).unwrap().balance(), Word::from(7));
-        assert_eq!(state.get_storage(&changed, &key), Some(Word::from(11)));
-        state.rollback(checkpoint, EvmFeatures::empty());
-        assert_eq!(state.account(&changed).unwrap().balance(), Word::ZERO);
-        assert_eq!(state.get_storage(&changed, &key), Some(Word::from(5)));
-        assert_eq!(state.tload(&changed, &key), Word::ZERO);
-        assert!(state.logs().is_empty());
-    }
-
-    #[test]
-    fn cool_loaded_state_uses_replacement_prewarm_set_without_changing_state() {
-        let old_base = Address::with_last_byte(41);
-        let new_base = Address::from([42; 20]);
-        let key = Word::ONE;
-        let mut state = State::new(EmptyDB::default());
-        state.prewarm_storage_slot(&old_base, key);
-        for address in [old_base, new_base] {
-            state.account(&address).unwrap().set_balance(Word::from(7));
-            state.account(&address).unwrap().warm();
-            state.storage_slot(&address, key).unwrap().set(Word::from(11));
-            state.storage_slot(&address, key).unwrap().warm();
-        }
-        state.account(&old_base).unwrap().mark_destructed();
-        state.tstore(&old_base, &key, &Word::from(13));
-        state.logs_mut().push(Log::default());
-        let journal = state.journal().to_vec();
-        let mut prewarm_set = PrewarmSet::new();
-        prewarm_set.warm_storage(&new_base, [key, Word::from(2)]);
-        state.set_prewarm_set(prewarm_set.clone());
-        assert_eq!(state.prewarm_set(), &prewarm_set);
-        assert!(state.account(&old_base).unwrap().is_warm());
-
-        state.cool_loaded_state();
-
-        assert_eq!(state.journal(), journal);
-        for address in [old_base, new_base] {
-            let account = state.account(&address).unwrap();
-            assert_eq!(account.is_warm(), address == new_base);
-            assert!(account.is_touched());
-            assert!(!account.is_created());
-            assert_eq!(account.balance(), Word::from(7));
-            drop(account);
-            let slot = state.storage_slot(&address, key).unwrap();
-            assert_eq!(slot.is_warm(), address == new_base);
-            assert_eq!((slot.original(), slot.current()), (Word::ZERO, Word::from(11)));
-        }
-        assert!(state.storage_slot(&new_base, Word::from(2)).unwrap().is_warm());
-        assert!(state.account(&old_base).unwrap().is_destructed());
-        assert_eq!(state.tload(&old_base, &key), Word::from(13));
-        assert_eq!(state.logs(), &[Log::default()]);
     }
 
     #[test]

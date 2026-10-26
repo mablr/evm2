@@ -196,6 +196,9 @@ pub(crate) struct Account {
     pub(crate) is_destroyed: bool,
     /// Whether the present overlay account was created in the current transaction.
     pub(crate) just_created: bool,
+    /// Whether a created account keeps its storage baseline, see
+    /// [`AccountHandle::mark_created_keeping_storage`]. Meaningful only while `just_created`.
+    pub(crate) keeps_storage: bool,
     /// Whether the present overlay account's code has been modified.
     pub(crate) code_changed: bool,
     /// Persistent transaction storage owned by this account.
@@ -224,7 +227,15 @@ impl Account {
     #[inline]
     pub(crate) const fn mark_created(&mut self) {
         self.just_created = true;
+        self.keeps_storage = false;
         self.code_changed = true;
+    }
+
+    /// Returns whether the account's creation discarded its storage baseline, so its unloaded
+    /// slots read as zero and committing it drops cached slots.
+    #[inline]
+    pub(crate) const fn discards_storage(&self) -> bool {
+        self.just_created && !self.keeps_storage
     }
 
     /// Returns whether the account was created during the transaction.
@@ -350,12 +361,8 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         if self.tracked.storage.slots.capacity() == 0 {
             self.tracked.storage.slots = self.storage_pool.take();
         }
-        StorageHandle::new(
-            &self.address,
-            &mut self.tracked.storage,
-            self.tracked.just_created,
-            self.inner,
-        )
+        let discards_storage = self.tracked.discards_storage();
+        StorageHandle::new(&self.address, &mut self.tracked.storage, discards_storage, self.inner)
     }
 
     /// Records the pre-mutation revert entry the first time a change is made through this handle.
@@ -647,6 +654,21 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     pub fn mark_created(&mut self) {
         self.record_change();
         self.tracked.mark_created();
+    }
+
+    /// Marks the present overlay account as created in the current transaction, like
+    /// [`Self::mark_created`], but keeps its storage baseline: unloaded slots read from the
+    /// database and committing the account does not drop its cached slots.
+    ///
+    /// For embedders that continue a transaction on a fresh overlay whose database already holds
+    /// the account's creation and storage writes, such as after suspending the transaction. The
+    /// account stays eligible for EIP-6780 `SELFDESTRUCT`. An account already created in this
+    /// overlay keeps reading its old storage as zero.
+    #[inline]
+    pub fn mark_created_keeping_storage(&mut self) {
+        let keeps_storage = !self.tracked.just_created;
+        self.mark_created();
+        self.tracked.keeps_storage = keeps_storage;
     }
 
     /// Records a revert snapshot and returns the live account, materializing an empty one when it

@@ -288,9 +288,8 @@ fn test_geth_jstracer_records_call_step_before_nested_execution() {
     assert_eq!(parent_stop["mem"].as_u64(), Some(32));
 }
 
-/// Runs a transaction through every kind of call-like step and returns the tracer's events and
-/// the transaction's gas used. With `throw`, the `step` callback throws on every call-like step.
-fn call_step_events(throw: bool) -> (serde_json::Value, u64) {
+#[test]
+fn test_geth_jstracer_call_step_cost_and_depth() {
     let leaf = address!("0000000000000000000000000000000000001111");
     let mid = address!("0000000000000000000000000000000000002222");
     let reverter = address!("0000000000000000000000000000000000003333");
@@ -343,7 +342,6 @@ fn call_step_events(throw: bool) -> (serde_json::Value, u64) {
         var op = log.op.toString();
         if (op.indexOf("CALL") >= 0 || op.indexOf("CREATE") >= 0) {
             this.events.push([op, log.getDepth(), log.getGas(), log.getCost(), log.stack.peek(1).toString(16)]);
-            if (this.throw) throw new Error("step failed");
         } else if (op == "ADD") {
             this.events.push([op, log.getDepth()]);
         }
@@ -352,9 +350,8 @@ fn call_step_events(throw: bool) -> (serde_json::Value, u64) {
     exit: function() { this.events.push(["exit"]); },
     fault: function(log) { this.events.push(["fault", log.getDepth()]); },
     result: function() { return this.events; }
-}"#
-    .replace("this.throw", if throw { "true" } else { "false" });
-    let insp = JsInspector::new(code, serde_json::Value::Null).unwrap();
+}"#;
+    let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
     let mut evm = context.build_mainnet().with_inspector(insp);
     let res = evm
         .inspect_tx(TxEnv {
@@ -367,12 +364,7 @@ fn call_step_events(throw: bool) -> (serde_json::Value, u64) {
     assert!(res.result.is_success(), "{res:#?}");
 
     let (context, insp) = evm.ctx_inspector();
-    (js_result(insp, &res, context), res.result.gas_used())
-}
-
-#[test]
-fn test_geth_jstracer_call_step_cost_and_depth() {
-    let (mut events, _) = call_step_events(false);
+    let mut events = js_result(insp, &res, context);
     // A call step costs the account access plus any value transfer (9000) plus the gas forwarded
     // to the child: 2600 for a cold account, 100 for a warm one or a precompile.
     let cold_call = 2600 + 0xffff;
@@ -431,11 +423,56 @@ fn test_geth_jstracer_call_step_cost_and_depth() {
 }
 
 #[test]
-fn test_geth_jstracer_call_step_error_does_not_affect_child() {
-    // Like revm-inspectors, an error thrown by `step` on a call-like step is ignored and the child
-    // runs with the gas it was given.
-    let (events, gas_used) = call_step_events(false);
-    assert_eq!(call_step_events(true), (events, gas_used));
+fn test_geth_jstracer_call_step_error_reverts_parent() {
+    let code = r#"
+{
+    events: [],
+    step: function(log) {
+        var op = log.op.toString();
+        if (op == "STOP") this.events.push(op + " " + log.getDepth());
+        if (op == "CALL" || op == "CREATE") {
+            this.events.push(op);
+            throw new Error("step failed");
+        }
+    },
+    enter: function(frame) { this.events.push("enter " + frame.getType()); },
+    exit: function(res) { this.events.push("exit " + res.getGasUsed()); },
+    fault: function() {},
+    result: function(ctx) { return { events: this.events, error: ctx.error }; }
+}"#;
+    // The child runs with the gas it was given, then the failed step reverts the parent before
+    // its final STOP, like an error thrown on any other step.
+    for (bytecode, expected) in [
+        // CALL(0xffff, identity precompile, 0, 0, 0, 0, 0), STOP
+        (&hex!("5f5f5f5f5f600461fffff100")[..], &["CALL", "enter CALL", "exit 15"][..]),
+        // CREATE(0, 0, 0) with empty initcode, STOP
+        (&hex!("5f5f5ff000")[..], &["CREATE", "enter CREATE", "STOP 2", "exit 0"][..]),
+    ] {
+        let address = address!("0000000000000000000000000000000000004444");
+        let mut context = Context::mainnet().with_db(CacheDB::<EmptyDB>::default());
+        context.db_mut().insert_account_info(
+            &address,
+            AccountInfo {
+                code: Some(Bytecode::new_legacy(bytecode.to_vec().into())),
+                ..Default::default()
+            },
+        );
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+        let mut evm = context.build_mainnet().with_inspector(insp);
+        let res = evm
+            .inspect_tx(TxEnv {
+                caller: Address::ZERO,
+                gas_limit: 1_000_000,
+                kind: TransactTo::Call(address),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!res.result.is_success(), "{res:#?}");
+
+        let (context, insp) = evm.ctx_inspector();
+        let result = js_result(insp, &res, context);
+        assert_eq!(result, json!({ "events": expected, "error": "execution reverted" }));
+    }
 }
 
 #[test]

@@ -227,7 +227,7 @@ fn test_geth_jstracer_proxy_contract() {
 }
 
 #[test]
-fn test_geth_jstracer_records_call_step_after_nested_execution() {
+fn test_geth_jstracer_records_call_step_before_nested_execution() {
     let child = address!("0000000000000000000000000000000000001234");
     let parent = address!("0000000000000000000000000000000000000022");
 
@@ -279,13 +279,116 @@ fn test_geth_jstracer_records_call_step_after_nested_execution() {
     let ops = result.as_array().unwrap();
     let call = ops.iter().position(|step| step["op"] == "CALL").expect("missing CALL step");
     let add = ops.iter().position(|step| step["op"] == "ADD").expect("missing child ADD step");
-    assert!(add < call, "CALL step_end should be observed after child execution: {ops:?}");
+    assert!(call < add, "CALL step should be observed before child execution: {ops:?}");
 
     let parent_stop = ops
         .iter()
-        .find(|step| step["op"] == "STOP" && step["depth"].as_u64() == Some(0))
+        .find(|step| step["op"] == "STOP" && step["depth"].as_u64() == Some(1))
         .expect("missing parent STOP step");
     assert_eq!(parent_stop["mem"].as_u64(), Some(32));
+}
+
+#[test]
+fn test_geth_jstracer_call_step_cost_and_depth() {
+    let leaf = address!("0000000000000000000000000000000000001111");
+    let mid = address!("0000000000000000000000000000000000002222");
+    let reverter = address!("0000000000000000000000000000000000003333");
+    let main = address!("0000000000000000000000000000000000004444");
+
+    // PUSH1 1, PUSH1 1, ADD, STOP
+    let leaf_code = hex!("600160010100");
+    // CALL(0x4000, leaf, 0, 0, 0, 0, 0), POP, STOP
+    let mid_code = hex!("5f5f5f5f5f611111614000f15000");
+    // REVERT(0, 0)
+    let reverter_code = hex!("5f5ffd");
+    let main_code = hex!(
+        // CALL(0xffff, mid, 0, 0, 0, 0, 0), POP
+        "5f5f5f5f5f61222261fffff150"
+        // CALL(0xffff, 0xdead, 0, 0, 0, 0, 0) to an account without code, POP
+        "5f5f5f5f5f61dead61fffff150"
+        // STATICCALL(0xffff, reverter, 0, 0, 0, 0), POP
+        "5f5f5f5f61333361fffffa50"
+        // MSTORE(0, 0x5f5ff3), CREATE(0, 29, 3) with initcode RETURN(0, 0), POP, STOP
+        "625f5ff35f526003601d5ff05000"
+    );
+
+    let context =
+        Context::mainnet().with_db(CacheDB::<EmptyDB>::default()).modify_db_chained(|db| {
+            for (address, code) in [
+                (leaf, &leaf_code[..]),
+                (mid, &mid_code[..]),
+                (reverter, &reverter_code[..]),
+                (main, &main_code[..]),
+            ] {
+                let code = Some(Bytecode::new_legacy(code.to_vec().into()));
+                db.insert_account_info(&address, AccountInfo { code, ..Default::default() });
+            }
+        });
+
+    let code = r#"
+{
+    events: [],
+    step: function(log) {
+        var op = log.op.toString();
+        if (op == "CALL" || op == "STATICCALL" || op == "CREATE") {
+            this.events.push([op, log.getDepth(), log.getGas(), log.getCost(), log.stack.peek(1).toString(16)]);
+        } else if (op == "ADD") {
+            this.events.push([op, log.getDepth()]);
+        }
+    },
+    enter: function(frame) { this.events.push(["enter", frame.getType()]); },
+    exit: function() { this.events.push(["exit"]); },
+    fault: function(log) { this.events.push(["fault", log.getDepth()]); },
+    result: function() { return this.events; }
+}"#;
+    let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+    let mut evm = context.build_mainnet().with_inspector(insp);
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller: Address::ZERO,
+            gas_limit: 1_000_000,
+            kind: TransactTo::Call(main),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(res.result.is_success(), "{res:#?}");
+
+    let (context, insp) = evm.ctx_inspector();
+    let mut events = js_result(insp, &res, context);
+    // A call step costs the cold account access (2600) plus the gas forwarded to the child.
+    let call_cost = 2600 + 0xffff;
+    // A CREATE step costs 32000 plus 2 per initcode word, then forwards all but 1/64 of the rest.
+    // The remaining gas is only needed to derive the CREATE cost.
+    let mut create_gas = 0;
+    for event in events.as_array_mut().unwrap().iter_mut().filter(|event| event[2].is_u64()) {
+        let gas = event[2].take().as_u64().unwrap();
+        if event[0] == "CREATE" {
+            create_gas = gas;
+        }
+    }
+    let create_cost = create_gas - (create_gas - 32002) / 64;
+    assert_eq!(
+        events,
+        json!([
+            ["CALL", 1, null, call_cost, "2222"],
+            ["enter", "CALL"],
+            ["CALL", 2, null, 2600 + 0x4000, "1111"],
+            ["enter", "CALL"],
+            ["ADD", 3],
+            ["exit"],
+            ["exit"],
+            ["CALL", 1, null, call_cost, "dead"],
+            ["enter", "CALL"],
+            ["exit"],
+            ["STATICCALL", 1, null, call_cost, "3333"],
+            ["enter", "STATICCALL"],
+            ["fault", 2],
+            ["exit"],
+            ["CREATE", 1, null, create_cost, "1d"],
+            ["enter", "CREATE"],
+            ["exit"],
+        ])
+    );
 }
 
 #[test]

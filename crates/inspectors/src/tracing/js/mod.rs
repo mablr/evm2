@@ -515,6 +515,71 @@ impl JsInspector {
         interp.set_stop(InstrStop::FatalExternalError);
         true
     }
+
+    /// Invokes `step`, or `fault` if the step reverted, for the pending step of the interpreter's
+    /// frame. Returns `None` if no step is pending, otherwise whether it reverted and the result.
+    fn emit_pending_step<T: EvmTypes>(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+    ) -> Option<(bool, JsResult<JsValue>)> {
+        let step_fn = self.step_fn.as_ref()?;
+        let depth = usize::from(interp.message().depth);
+        let pending = self.pending_steps.get_mut(depth)?;
+        if !core::mem::take(&mut pending.active) {
+            return None;
+        }
+        let result = interp.result();
+        let is_revert = matches!(result, Err(stop) if stop.is_revert());
+        let call = self.call_stack.last().expect("call stack is empty");
+        let info = StepInfo {
+            cost: interp.gas().spent().saturating_sub(pending.gas_spent_before),
+            // Geth reports the depth starting at 1 for the top-level call.
+            depth: depth as u64 + 1,
+            error: if is_revert { result.err().map(|err| format!("{err:?}")) } else { None },
+            op: is_revert.then_some(op::REVERT),
+            caller: interp.message().caller,
+            contract: interp.message().destination,
+            value: call.contract.value,
+            input: &call.contract.input,
+            call_id: call.id,
+        };
+        let (stack, memory, host) = interp.stack_memory_host();
+        let res = self.reusable_db.with_state_scope(host.state_mut(), || {
+            self.reusable_step_log.with_scope(
+                &mut pending.snapshot,
+                stack.as_slice(),
+                memory,
+                info,
+                || {
+                    let f = if is_revert { &self.fault_fn } else { step_fn };
+                    f.call(
+                        &self.this,
+                        &[self.reusable_step_log.value(), self.reusable_db.value()],
+                        &mut self.ctx,
+                    )
+                },
+            )
+        });
+        Some((is_revert, res))
+    }
+
+    /// Ends the parent's call-like step before its child message runs, like geth does.
+    ///
+    /// Invoked on [Inspector::call] and [Inspector::create]. The parent frame has charged the step
+    /// at this point, including the gas forwarded to the child, but the child has not returned any
+    /// gas yet. `step_end` then skips the step.
+    fn emit_call_step<T: EvmTypes>(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+    ) -> Option<MessageResult<T>> {
+        // The top-level message has no parent step.
+        if message.depth != interp.message().depth + 1 {
+            return None;
+        }
+        let (_, res) = self.emit_pending_step(interp)?;
+        res.err().map(js_error_to_revert)
+    }
 }
 
 impl<T: EvmTypes> Inspector<T> for JsInspector {
@@ -543,51 +608,13 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
         if self.check_and_halt(interp) {
             return;
         }
-        let Some(step_fn) = &self.step_fn else {
+        let Some((is_revert, res)) = self.emit_pending_step(interp) else {
             return;
         };
-        let depth = usize::from(interp.message().depth);
-        let Some(pending) = self.pending_steps.get_mut(depth) else {
-            return;
-        };
-        if !core::mem::take(&mut pending.active) {
-            return;
-        }
-        let result = interp.result();
-        let is_revert = matches!(result, Err(stop) if stop.is_revert());
-        let call = self.call_stack.last().expect("call stack is empty");
-        let info = StepInfo {
-            cost: interp.gas().spent().saturating_sub(pending.gas_spent_before),
-            depth: depth as u64,
-            error: if is_revert { result.err().map(|err| format!("{err:?}")) } else { None },
-            op: is_revert.then_some(op::REVERT),
-            caller: interp.message().caller,
-            contract: interp.message().destination,
-            value: call.contract.value,
-            input: &call.contract.input,
-            call_id: call.id,
-        };
-        let (stack, memory, host) = interp.stack_memory_host();
-        let res = self.reusable_db.with_state_scope(host.state_mut(), || {
-            self.reusable_step_log.with_scope(
-                &mut pending.snapshot,
-                stack.as_slice(),
-                memory,
-                info,
-                || {
-                    let f = if is_revert { &self.fault_fn } else { step_fn };
-                    f.call(
-                        &self.this,
-                        &[self.reusable_step_log.value(), self.reusable_db.value()],
-                        &mut self.ctx,
-                    )
-                },
-            )
-        });
         if self.check_and_halt(interp) {
             return;
         }
-        if !is_revert && res.is_err() && result.is_ok() {
+        if !is_revert && res.is_err() && interp.result().is_ok() {
             interp.set_stop(InstrStop::Revert);
         }
     }
@@ -601,6 +628,7 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             return None;
         }
         self.register_precompiles(interp.host());
+        let mut result = self.emit_call_step(interp, message);
 
         // determine contract and caller based on the call scheme
         let (caller, contract) = match message.kind {
@@ -621,8 +649,7 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             message.gas_limit,
         );
 
-        let mut result = None;
-        if self.can_call_enter() {
+        if result.is_none() && self.can_call_enter() {
             let call = self.active_call();
             let frame =
                 CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };
@@ -666,6 +693,7 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             return None;
         }
         self.register_precompiles(interp.host());
+        let mut result = self.emit_call_step(interp, message);
         self.push_call(
             message.destination,
             message.input.clone(),
@@ -675,8 +703,7 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             message.gas_limit,
         );
 
-        let mut result = None;
-        if self.can_call_enter() {
+        if result.is_none() && self.can_call_enter() {
             let call = self.active_call();
             let frame =
                 CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };

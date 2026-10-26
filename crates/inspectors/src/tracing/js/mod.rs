@@ -563,22 +563,37 @@ impl JsInspector {
         Some((is_revert, res))
     }
 
-    /// Ends the parent's call-like step before its child message runs, like geth does.
+    /// Ends the parent's call-like step before its child message runs, like revm-inspectors and
+    /// geth do.
     ///
     /// Invoked on [Inspector::call] and [Inspector::create]. The parent frame has charged the step
     /// at this point, including the gas forwarded to the child, but the child has not returned any
-    /// gas yet. `step_end` then skips the step.
+    /// gas yet. `step_end` then skips the step. Like revm-inspectors, an error thrown by the step
+    /// callback does not affect the child.
     fn emit_call_step<T: EvmTypes>(
         &mut self,
         interp: &mut Interpreter<'_, '_, T>,
         message: &Message<T>,
-    ) -> Option<MessageResult<T>> {
-        // The top-level message has no parent step.
-        if message.depth != interp.message().depth + 1 {
-            return None;
+    ) {
+        // Only a call-like step of the active frame starts the child, not one of an outer
+        // transaction that started a nested one from a hook.
+        let depth = usize::from(interp.message().depth);
+        if message.depth == interp.message().depth + 1
+            && self.pending_steps.get(depth).is_some_and(|pending| {
+                pending.active
+                    && matches!(
+                        pending.snapshot.op(),
+                        op::CALL
+                            | op::CALLCODE
+                            | op::DELEGATECALL
+                            | op::STATICCALL
+                            | op::CREATE
+                            | op::CREATE2
+                    )
+            })
+        {
+            let _ = self.emit_pending_step(interp);
         }
-        let (_, res) = self.emit_pending_step(interp)?;
-        res.err().map(js_error_to_revert)
     }
 }
 
@@ -628,7 +643,7 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             return None;
         }
         self.register_precompiles(interp.host());
-        let mut result = self.emit_call_step(interp, message);
+        self.emit_call_step(interp, message);
 
         // determine contract and caller based on the call scheme
         let (caller, contract) = match message.kind {
@@ -649,7 +664,8 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             message.gas_limit,
         );
 
-        if result.is_none() && self.can_call_enter() {
+        let mut result = None;
+        if self.can_call_enter() {
             let call = self.active_call();
             let frame =
                 CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };
@@ -693,7 +709,7 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             return None;
         }
         self.register_precompiles(interp.host());
-        let mut result = self.emit_call_step(interp, message);
+        self.emit_call_step(interp, message);
         self.push_call(
             message.destination,
             message.input.clone(),
@@ -703,7 +719,8 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             message.gas_limit,
         );
 
-        if result.is_none() && self.can_call_enter() {
+        let mut result = None;
+        if self.can_call_enter() {
             let call = self.active_call();
             let frame =
                 CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };

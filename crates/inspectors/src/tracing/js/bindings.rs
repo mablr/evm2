@@ -620,6 +620,11 @@ pub(crate) struct StepSnapshot {
 }
 
 impl StepSnapshot {
+    /// Returns the recorded opcode.
+    pub(crate) const fn op(&self) -> u8 {
+        self.op
+    }
+
     /// Records everything about a step that must be captured before the opcode executes.
     pub(crate) fn record(&mut self, step: PreStep<'_>) {
         let PreStep { pc, op, gas_remaining, refund, stack, memory } = step;
@@ -751,7 +756,8 @@ impl StackView {
 ///
 /// Opcodes only ever expand memory or overwrite a single range, so restoring that range and
 /// truncating to the pre-execution length yields the pre-execution memory. Call output ranges are
-/// also saved because evm2 reports `step_end` after the child has returned.
+/// also saved, so the view stays correct if a call-like step is reported after its child wrote
+/// its output. The `call` and `create` hooks normally report the step before the child runs.
 #[derive(Debug, Default)]
 struct MemoryView {
     /// Pre-execution length.

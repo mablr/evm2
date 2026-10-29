@@ -45,6 +45,8 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     step_gas_after_charge: Option<u64>,
     pub(in crate::interpreter) result: Result,
     error: Option<ExecutionError>,
+    /// Whether the frame runs the instruction table with inspector steps.
+    stepping: bool,
     spec: SpecId,
     features: EvmFeatures,
     is_static: bool,
@@ -87,6 +89,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             memory: Memory::new(),
             result: Ok(()),
             error: None,
+            stepping: false,
             output: 0..0,
             message: None,
             is_static: false,
@@ -507,9 +510,25 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             // across setup, which makes the dispatch loop spill the stack pointer.
             // SAFETY: `prepare_run` initialized the host, and the config is only read here.
             let config = unsafe { self.execution_config_detached() };
-            let instructions =
-                if inspector.is_some() { config.inspect_instructions } else { config.instructions };
-            dispatch::run(self, instructions)
+            // SAFETY: The inspector pointer is valid for this run.
+            let mut stepping =
+                inspector.is_some_and(|inspector| unsafe { inspector.as_ref() }.wants_steps());
+            loop {
+                self.stepping = stepping;
+                let instructions = if stepping {
+                    config.inspect_instructions
+                } else if inspector.is_some() {
+                    config.lazy_instructions
+                } else {
+                    config.instructions
+                };
+                let stop = dispatch::run(self, instructions);
+                if stop != InstrStop::ResumeStepping {
+                    break stop;
+                }
+                self.result = Ok(());
+                stepping = true;
+            }
         };
         self.finish_run(stop)
     }
@@ -572,7 +591,28 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
     #[inline]
     #[cfg(not(tco))]
     pub(crate) const fn is_inspecting(&self) -> bool {
+        self.0.stepping
+    }
+
+    #[inline]
+    #[cfg(not(tco))]
+    pub(crate) const fn has_inspector(&self) -> bool {
         self.0.inspector.is_some()
+    }
+
+    /// Returns [`InstrStop::ResumeStepping`] when the frame runs without inspector steps but its
+    /// inspector now wants them, such as after a child message enabled a hook.
+    #[inline]
+    pub(crate) fn resume_stepping(&self) -> Result {
+        if !self.0.stepping
+            && let Some(inspector) = self.0.inspector
+            // SAFETY: The inspector pointer is valid while the frame executes.
+            && unsafe { inspector.as_ref() }.wants_steps()
+        {
+            cold_path();
+            return Err(InstrStop::ResumeStepping);
+        }
+        Ok(())
     }
 
     #[inline]

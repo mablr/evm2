@@ -76,6 +76,11 @@ extern_table! {
         if M::INSPECT || dynamic_gas {
             state.gas_mut().set_remaining(remaining_gas.get());
         }
+        if M::LAZY {
+            // Inspector message hooks read the calling instruction, which steps would have
+            // published.
+            state.set_pc_stack_len(pc.as_ptr(), stack.len());
+        }
         let (r, stack_len) = {
             // SAFETY: This is the only stack borrow outside inspector callbacks.
             let mut stack_view = unsafe { stack.borrow() };
@@ -96,6 +101,15 @@ extern_table! {
             tail_return!(tail_call_restore(pc, stack, remaining_gas, state, instructions));
         }
         super::inc_pc(&mut pc, OP);
+        if M::LAZY
+            && let Err(e) = state.resume_stepping()
+        {
+            // The child message made the inspector want steps. Leave after this instruction so the
+            // frame continues on the inspect table.
+            cold_path();
+            state.set_result(Err(e));
+            tail_return!(tail_call_restore(pc, stack, remaining_gas, state, instructions));
+        }
         if M::INSPECT {
             M::step_end(state, pc, stack.len());
             remaining_gas.set(state.gas_mut().remaining());

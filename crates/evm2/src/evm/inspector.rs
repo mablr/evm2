@@ -18,6 +18,16 @@ pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
         let _ = interp;
     }
 
+    /// Returns whether [`Self::step`] and [`Self::step_end`] must run.
+    ///
+    /// Checked when a frame starts and when a child message returns into a frame that runs
+    /// without steps. Return `false` only while both hooks would do nothing; a frame then runs
+    /// on the instruction table without inspector steps. Call, create and log hooks still run.
+    #[inline]
+    fn wants_steps(&self) -> bool {
+        true
+    }
+
     /// Called before each instruction executes.
     #[inline]
     fn step(&mut self, interp: &mut Interpreter<'_, '_, T>) {
@@ -622,6 +632,99 @@ mod tests {
             assert_eq!(result.stop, InstrStop::Stop);
             assert_eq!(result.gas.remaining(), 4098);
             assert_eq!((inspector.calls, inspector.ends), (1, 1));
+        }
+    }
+
+    #[test]
+    fn frame_resumes_stepping_when_a_child_message_enables_steps() {
+        struct LazyInspector {
+            lazy: bool,
+            enabled: bool,
+            stepped: Vec<u8>,
+            stack_after_call: Option<Word>,
+            call_pc: Option<usize>,
+        }
+
+        impl Inspector<BaseEvmTypes> for LazyInspector {
+            fn wants_steps(&self) -> bool {
+                !self.lazy || self.enabled
+            }
+
+            fn step(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                if self.enabled && self.stack_after_call.is_none() {
+                    self.stack_after_call = interp.stack().last().copied();
+                }
+                self.stepped.push(interp.opcode());
+            }
+
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                if message.depth > 0 {
+                    // Like a cheatcode that enables a step hook in its caller.
+                    self.enabled = true;
+                    self.call_pc = Some(interp.pc());
+                }
+                None
+            }
+        }
+
+        let mut code = call_code(Address::from([0x66; 20]));
+        code.extend([op::CALL, op::GAS, op::POP, op::STOP]);
+        let run = |lazy| {
+            run_evm_with_inspector(
+                code.clone(),
+                &MessageExt::default(),
+                100_000,
+                LazyInspector {
+                    lazy,
+                    enabled: false,
+                    stepped: Vec::new(),
+                    stack_after_call: None,
+                    call_pc: None,
+                },
+            )
+        };
+        let (eager, eager_inspector, _) = run(false);
+        let (lazy, lazy_inspector, _) = run(true);
+        assert_eq!(lazy.stop, InstrStop::Stop);
+        assert_eq!((lazy.stop, lazy.gas.remaining()), (eager.stop, eager.gas.remaining()));
+        assert_eq!(lazy_inspector.stack_after_call, Some(Word::ONE));
+        // Message hooks see the calling instruction, as when stepping.
+        assert_eq!(eager_inspector.call_pc, Some(code.len() - 4));
+        assert_eq!(lazy_inspector.call_pc, eager_inspector.call_pc);
+        assert!(eager_inspector.stepped.ends_with(&[op::CALL, op::GAS, op::POP, op::STOP]));
+        // The frame resumes after the CALL, which pushed its success flag, and steps the rest.
+        assert_eq!(lazy_inspector.stepped, [op::GAS, op::POP, op::STOP]);
+    }
+
+    #[test]
+    fn frame_without_steps_keeps_the_spec_opcode_set() {
+        struct NoSteps;
+
+        impl Inspector<BaseEvmTypes> for NoSteps {
+            fn wants_steps(&self) -> bool {
+                false
+            }
+        }
+
+        let mut code = Vec::new();
+        push_all(&mut code, [Word::ZERO, Word::ZERO, Word::ZERO, Word::ZERO]);
+        code.extend([op::CREATE2, op::STOP]);
+        for (spec_id, expected) in
+            [(SpecId::FRONTIER, InstrStop::NotActivated), (SpecId::PETERSBURG, InstrStop::Stop)]
+        {
+            let (result, _, _) = run_evm_with_inspector_db_spec(
+                spec_id,
+                InMemoryDB::default(),
+                code.clone(),
+                &MessageExt::default(),
+                100_000,
+                NoSteps,
+            );
+            assert_eq!(result.stop, expected, "{spec_id:?}");
         }
     }
 

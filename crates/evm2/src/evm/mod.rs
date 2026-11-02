@@ -1931,11 +1931,13 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         };
 
         if contract != target {
-            let transferred =
-                self.state.transfer(contract, target, &balance).map_err(HostError::from)?;
-            if transferred {
-                self.log_eip7708_transfer(contract, target, &balance);
+            if !self.state.transfer(contract, target, &balance).map_err(HostError::from)? {
+                // `transfer` refuses to overflow the beneficiary, but SELFDESTRUCT always moves
+                // the whole balance and credits the beneficiary with a wrapping add.
+                self.state.account(contract)?.set_balance(Word::ZERO);
+                self.state.account(target)?.add_balance(balance);
             }
+            self.log_eip7708_transfer(contract, target, &balance);
         } else if should_destroy && !balance.is_zero() && !self.feature(EvmFeatures::EIP8246) {
             // Pre-EIP-8246: SELFDESTRUCT to self burns the contract's balance. EIP-8246 removes
             // this burn, leaving the balance untouched; finalization resets the account
@@ -4111,6 +4113,62 @@ mod tests {
                 .unwrap()
                 .balance,
             U256::from(7)
+        );
+    }
+
+    #[test]
+    fn transfer_overflowing_recipient_changes_no_balance() {
+        let from = Address::from([0x01; 20]);
+        let to = Address::from([0x02; 20]);
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(&from, AccountInfo::default().with_balance(U256::from(2)));
+        database.insert_account_info(&to, AccountInfo::default().with_balance(U256::MAX));
+        let mut state = State::new(database);
+
+        assert!(!state.transfer(&from, &to, &U256::from(1)).unwrap());
+        assert_eq!(state.account_info_untracked(&from).unwrap().unwrap().balance, U256::from(2));
+        assert_eq!(state.account_info_untracked(&to).unwrap().unwrap().balance, U256::MAX);
+    }
+
+    #[test]
+    fn selfdestruct_wraps_overflowing_beneficiary_balance() {
+        let contract = Address::from([0xbb; 20]);
+        let target = Address::from([0xcc; 20]);
+        let mut code = Vec::new();
+        push_address(&mut code, &target);
+        code.push(op::SELFDESTRUCT);
+        let code = legacy_bytecode(code);
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(
+            &contract,
+            AccountInfo::default().with_balance(U256::from(2)).with_code(code.clone()),
+        );
+        database.insert_account_info(&target, AccountInfo::default().with_balance(U256::MAX));
+        let mut evm = Evm::<BaseEvmTypes>::new(
+            SpecId::CANCUN,
+            BlockEnvExt::default(),
+            TxRegistry::new(),
+            database,
+            Precompiles::base(SpecId::CANCUN),
+        );
+        let mut message = MessageExt {
+            kind: MessageKind::Call,
+            destination: contract,
+            code_address: contract,
+            gas_limit: 30_000,
+            code,
+            ..MessageExt::default()
+        };
+
+        let result = Host::execute_message(&mut evm, &mut message).unwrap();
+        assert!(result.stop.is_success());
+        assert_eq!(
+            evm.state.account_info_untracked(&contract).unwrap().unwrap().balance,
+            U256::ZERO
+        );
+        assert_eq!(
+            evm.state.account_info_untracked(&target).unwrap().unwrap().balance,
+            U256::from(1)
         );
     }
 

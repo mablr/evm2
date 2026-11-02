@@ -685,6 +685,9 @@ impl<'a> State<'a> {
     }
 
     /// Transfers value between accounts.
+    ///
+    /// Returns `false` without changing either balance when the sender cannot cover `value` or
+    /// when crediting the recipient would overflow its balance.
     pub fn transfer(&mut self, from: &Address, to: &Address, value: &Word) -> DbResult<bool> {
         if value.is_zero() {
             self.account(to)?.touch();
@@ -700,18 +703,20 @@ impl<'a> State<'a> {
             return Ok(true);
         }
 
+        let Some(new_from_balance) = self.account(from)?.balance().checked_sub(*value) else {
+            return Ok(false);
+        };
+        let Some(new_to_balance) = self.account(to)?.balance().checked_add(*value) else {
+            return Ok(false);
+        };
         {
             let mut from_account = self.account(from)?;
-            let Some(new_from_balance) = from_account.balance().checked_sub(*value) else {
-                return Ok(false);
-            };
             // `set_balance` touches the account, matching the touch the prior `transfer` performed.
             from_account.set_balance(new_from_balance);
             from_account.touch();
         }
         {
             let mut to_account = self.account(to)?;
-            let new_to_balance = to_account.balance().saturating_add(*value);
             to_account.set_balance(new_to_balance);
             to_account.touch();
         }
